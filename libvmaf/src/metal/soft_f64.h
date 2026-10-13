@@ -1,0 +1,315 @@
+/**
+ *
+ *  Copyright 2016-2026 Netflix, Inc.
+ *
+ *     Licensed under the BSD+Patent License (the "License");
+ *     you may not use this file except in compliance with the License.
+ *     You may obtain a copy of the License at
+ *
+ *         https://opensource.org/licenses/BSDplusPatent
+ *
+ *     Unless required by applicable law or agreed to in writing, software
+ *     distributed under the License is distributed on an "AS IS" BASIS,
+ *     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *     See the License for the specific language governing permissions and
+ *     limitations under the License.
+ *
+ */
+
+/**
+ * Software IEEE-754 binary64 arithmetic, bit-exact with hardware doubles
+ * (round to nearest, ties to even). Metal has no fp64; Metal kernels use this
+ * where the CPU feature extractors compute with doubles.
+ *
+ * This header is shared between Metal kernels and C (unit tests). Values are
+ * restricted to zero and finite normal numbers: no subnormals, infinities or
+ * NaNs, which is sufficient for the feature extractors.
+ */
+
+#ifndef __VMAF_SRC_METAL_SOFT_F64_H__
+#define __VMAF_SRC_METAL_SOFT_F64_H__
+
+#ifdef __METAL_VERSION__
+typedef ulong sf_u64;
+typedef long sf_i64;
+typedef int sf_i32;
+static inline sf_u64 sf_mulhi(sf_u64 a, sf_u64 b) { return mulhi(a, b); }
+static inline sf_i32 sf_clz64(sf_u64 x) { return (sf_i32)clz(x); }
+#else
+#include <stdbool.h>
+#include <stdint.h>
+typedef uint64_t sf_u64;
+typedef int64_t sf_i64;
+typedef int32_t sf_i32;
+static inline sf_u64 sf_mulhi(sf_u64 a, sf_u64 b)
+{
+    return (sf_u64)(((unsigned __int128)a * b) >> 64);
+}
+static inline sf_i32 sf_clz64(sf_u64 x) { return x ? __builtin_clzll(x) : 64; }
+#endif
+
+/** value = (-1)^s * m * 2^e, m == 0 or 2^52 <= m < 2^53 */
+typedef struct sf64 {
+    sf_u64 m;
+    sf_i32 e;
+    sf_i32 s;
+} sf64;
+
+typedef struct sf_u128 {
+    sf_u64 hi, lo;
+} sf_u128;
+
+static inline sf_u128 sf_u128_make(sf_u64 hi, sf_u64 lo)
+{
+    sf_u128 r;
+    r.hi = hi;
+    r.lo = lo;
+    return r;
+}
+
+static inline sf_i32 sf_u128_clz(sf_u128 a)
+{
+    return a.hi ? sf_clz64(a.hi) : 64 + sf_clz64(a.lo);
+}
+
+static inline sf_u128 sf_u128_shl(sf_u128 a, sf_i32 n)
+{
+    if (n <= 0) return a;
+    if (n >= 128) return sf_u128_make(0, 0);
+    if (n >= 64) return sf_u128_make(a.lo << (n - 64), 0);
+    return sf_u128_make((a.hi << n) | (a.lo >> (64 - n)), a.lo << n);
+}
+
+static inline sf_u128 sf_u128_shr(sf_u128 a, sf_i32 n)
+{
+    if (n <= 0) return a;
+    if (n >= 128) return sf_u128_make(0, 0);
+    if (n >= 64) return sf_u128_make(0, a.hi >> (n - 64));
+    return sf_u128_make(a.hi >> n, (a.lo >> n) | (a.hi << (64 - n)));
+}
+
+/** true if any of the low n bits of a are set */
+static inline bool sf_u128_low_bits(sf_u128 a, sf_i32 n)
+{
+    if (n <= 0) return false;
+    if (n >= 128) return (a.hi | a.lo) != 0;
+    if (n >= 64) {
+        const sf_u64 mask = n == 64 ? 0 : (~(sf_u64)0 >> (128 - n));
+        return a.lo != 0 || (a.hi & mask) != 0;
+    }
+    return (a.lo & (~(sf_u64)0 >> (64 - n))) != 0;
+}
+
+static inline sf_u128 sf_u128_add(sf_u128 a, sf_u128 b)
+{
+    const sf_u64 lo = a.lo + b.lo;
+    return sf_u128_make(a.hi + b.hi + (lo < a.lo ? 1 : 0), lo);
+}
+
+/** a - b, requires a >= b */
+static inline sf_u128 sf_u128_sub(sf_u128 a, sf_u128 b)
+{
+    return sf_u128_make(a.hi - b.hi - (a.lo < b.lo ? 1 : 0), a.lo - b.lo);
+}
+
+static inline bool sf_u128_lt(sf_u128 a, sf_u128 b)
+{
+    return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
+}
+
+static inline sf_u128 sf_mul64(sf_u64 a, sf_u64 b)
+{
+    return sf_u128_make(sf_mulhi(a, b), a * b);
+}
+
+static inline sf64 sf_zero(void)
+{
+    sf64 r;
+    r.m = 0;
+    r.e = 0;
+    r.s = 0;
+    return r;
+}
+
+/**
+ * Round (-1)^s * (M + sticky) * 2^E to 53 bits. `sticky` signals nonzero bits
+ * below the least significant bit of M, it requires M to carry at least two
+ * bits more than the target precision.
+ */
+static inline sf64 sf_round(sf_u128 M, sf_i32 E, bool sticky, sf_i32 s)
+{
+    if (!M.hi && !M.lo) return sf_zero();
+
+    const sf_i32 p = 127 - sf_u128_clz(M);
+    sf64 r;
+    r.s = s;
+    if (p <= 52) {
+        r.m = M.lo << (52 - p);
+        r.e = E - (52 - p);
+        return r;
+    }
+
+    const sf_i32 sh = p - 52;
+    sf_u64 q = sf_u128_shr(M, sh).lo;
+    const bool guard = (sf_u128_shr(M, sh - 1).lo & 1) != 0;
+    const bool rest = sticky || sf_u128_low_bits(M, sh - 1);
+    sf_i32 e = E + sh;
+    if (guard && (rest || (q & 1))) {
+        q++;
+        if (q == ((sf_u64)1 << 53)) {
+            q >>= 1;
+            e++;
+        }
+    }
+    r.m = q;
+    r.e = e;
+    return r;
+}
+
+static inline sf64 sf_from_bits(sf_u64 bits)
+{
+    const sf_i32 exp = (sf_i32)((bits >> 52) & 0x7ff);
+    if (!exp) return sf_zero();
+    sf64 r;
+    r.m = (bits & (((sf_u64)1 << 52) - 1)) | ((sf_u64)1 << 52);
+    r.e = exp - 1075;
+    r.s = (sf_i32)(bits >> 63);
+    return r;
+}
+
+static inline sf_u64 sf_to_bits(sf64 a)
+{
+    const sf_u64 sign = (sf_u64)a.s << 63;
+    if (!a.m) return sign;
+    return sign | ((sf_u64)(a.e + 1075) << 52) |
+           (a.m & (((sf_u64)1 << 52) - 1));
+}
+
+static inline sf64 sf_from_u64(sf_u64 x)
+{
+    return sf_round(sf_u128_make(0, x), 0, false, 0);
+}
+
+static inline sf64 sf_from_i64(sf_i64 x)
+{
+    if (x < 0) return sf_round(sf_u128_make(0, (sf_u64)0 - (sf_u64)x), 0, false, 1);
+    return sf_from_u64((sf_u64)x);
+}
+
+static inline sf64 sf_neg(sf64 a)
+{
+    a.s ^= 1;
+    return a;
+}
+
+/**
+ * Round (-1)^sa * A * 2^Ea + (-1)^sb * B * 2^Eb, exact inputs of up to 126
+ * bits.
+ */
+static inline sf64 sf_add_exact(sf_u128 A, sf_i32 Ea, sf_i32 sa,
+                                sf_u128 B, sf_i32 Eb, sf_i32 sb)
+{
+    const bool a0 = !A.hi && !A.lo;
+    const bool b0 = !B.hi && !B.lo;
+    if (a0 && b0) return sf_zero();
+    if (b0) return sf_round(A, Ea, false, sa);
+    if (a0) return sf_round(B, Eb, false, sb);
+
+    // X: operand with the larger leading bit position, normalized such that
+    // its leading bit is bit 126. Y: aligned to X, with sticky.
+    const sf_i32 la = 127 - sf_u128_clz(A), lb = 127 - sf_u128_clz(B);
+    sf_u128 X, Y;
+    sf_i32 Ex, Ey, sx, sy, lx;
+    if (la + Ea >= lb + Eb) {
+        X = A; Ex = Ea; sx = sa; lx = la;
+        Y = B; Ey = Eb; sy = sb;
+    } else {
+        X = B; Ex = Eb; sx = sb; lx = lb;
+        Y = A; Ey = Ea; sy = sa;
+    }
+    const sf_i32 hx = 126 - lx;
+    X = sf_u128_shl(X, hx);
+    const sf_i32 E = Ex - hx;
+    const sf_i32 d = Ey - E;
+    bool sticky = false;
+    if (d >= 0) {
+        Y = sf_u128_shl(Y, d);
+    } else {
+        sticky = sf_u128_low_bits(Y, -d);
+        Y = sf_u128_shr(Y, -d);
+    }
+
+    if (sx == sy) return sf_round(sf_u128_add(X, Y), E, sticky, sx);
+
+    if (sf_u128_lt(X, Y)) { // only possible without sticky
+        const sf_u128 t = X;
+        X = Y;
+        Y = t;
+        sx = sy;
+    }
+    sf_u128 M = sf_u128_sub(X, Y);
+    if (sticky) M = sf_u128_sub(M, sf_u128_make(0, 1));
+    return sf_round(M, E, sticky, sx);
+}
+
+static inline sf64 sf_add(sf64 a, sf64 b)
+{
+    return sf_add_exact(sf_u128_make(0, a.m), a.e, a.s,
+                        sf_u128_make(0, b.m), b.e, b.s);
+}
+
+static inline sf64 sf_sub(sf64 a, sf64 b)
+{
+    return sf_add(a, sf_neg(b));
+}
+
+static inline sf64 sf_mul(sf64 a, sf64 b)
+{
+    if (!a.m || !b.m) return sf_zero();
+    return sf_round(sf_mul64(a.m, b.m), a.e + b.e, false, a.s ^ b.s);
+}
+
+/** fma(a, b, c) = a * b + c with a single rounding */
+static inline sf64 sf_fma(sf64 a, sf64 b, sf64 c)
+{
+    if (!a.m || !b.m) return c;
+    return sf_add_exact(sf_mul64(a.m, b.m), a.e + b.e, a.s ^ b.s,
+                        sf_u128_make(0, c.m), c.e, c.s);
+}
+
+static inline sf64 sf_div(sf64 a, sf64 b)
+{
+    if (!a.m) return sf_zero();
+    // restoring division: q = floor(a.m * 2^55 / b.m), 55 or 56 bits
+    sf_u64 r = a.m, q = 0;
+    for (int i = 0; i < 56; i++) {
+        q <<= 1;
+        if (r >= b.m) {
+            r -= b.m;
+            q |= 1;
+        }
+        r <<= 1;
+    }
+    return sf_round(sf_u128_make(0, q), a.e - b.e - 55, r != 0, a.s ^ b.s);
+}
+
+/** a < b */
+static inline bool sf_lt(sf64 a, sf64 b)
+{
+    if (!a.m && !b.m) return false;
+    if (a.s != b.s) return a.s != 0;
+    const bool mag_lt = !a.m || (b.m && (a.e < b.e || (a.e == b.e && a.m < b.m)));
+    const bool mag_eq = a.m == b.m && (a.e == b.e || !a.m);
+    if (mag_eq) return false;
+    return a.s ? !mag_lt : mag_lt;
+}
+
+/** conversion to integer, rounding toward zero (C cast semantics) */
+static inline sf_i64 sf_trunc_i64(sf64 a)
+{
+    if (!a.m || a.e <= -53) return 0;
+    const sf_u64 v = a.e >= 0 ? a.m << a.e : a.m >> -a.e;
+    return a.s ? -(sf_i64)v : (sf_i64)v;
+}
+
+#endif /* __VMAF_SRC_METAL_SOFT_F64_H__ */

@@ -58,6 +58,11 @@
 #include "cuda/ring_buffer.h"
 #endif
 
+#ifdef HAVE_METAL
+#include "libvmaf/libvmaf_metal.h"
+#include "metal/common.h"
+#endif
+
 #include "picture_pool.h"
 
 typedef struct VmafContext {
@@ -84,6 +89,9 @@ typedef struct VmafContext {
         VmafCudaCookie cookie;
         VmafRingBuffer* ring_buffer;
     } cuda;
+#endif
+#ifdef HAVE_METAL
+    VmafMetalState *metal_state;
 #endif
     struct {
         unsigned w, h;
@@ -282,6 +290,28 @@ static int set_fex_cuda_state(VmafFeatureExtractorContext *fex_ctx,
 
 #endif
 
+#ifdef HAVE_METAL
+
+int vmaf_metal_import_state(VmafContext *vmaf, VmafMetalState *metal_state)
+{
+    if (!vmaf) return -EINVAL;
+    if (!metal_state) return -EINVAL;
+    if (vmaf->metal_state) return -EINVAL;
+
+    vmaf->metal_state = metal_state;
+    return 0;
+}
+
+static int set_fex_metal_state(VmafFeatureExtractorContext *fex_ctx,
+                               VmafContext *vmaf)
+{
+    if (fex_ctx->fex->flags & VMAF_FEATURE_EXTRACTOR_METAL)
+        fex_ctx->fex->metal_state = vmaf->metal_state;
+    return 0;
+}
+
+#endif
+
 static int prepare_picture_pool(VmafContext *vmaf, unsigned pic_cnt,
                                 unsigned w, unsigned h,
                                 enum VmafPixelFormat pix_fmt, unsigned bpc)
@@ -375,6 +405,9 @@ int vmaf_close(VmafContext *vmaf)
     if (vmaf->cuda.state.ctx)
         vmaf_cuda_release(&vmaf->cuda.state);
 #endif
+#ifdef HAVE_METAL
+    vmaf_metal_state_free(vmaf->metal_state);
+#endif
     free(vmaf);
 
     return 0;
@@ -417,6 +450,9 @@ int vmaf_use_feature(VmafContext *vmaf, const char *feature_name,
 #ifdef HAVE_CUDA
     err |= set_fex_cuda_state(fex_ctx, vmaf);
 #endif
+#ifdef HAVE_METAL
+    err |= set_fex_metal_state(fex_ctx, vmaf);
+#endif
     err |= set_fex_framesync(fex_ctx, vmaf);
     if (err) return err;
 
@@ -449,9 +485,19 @@ int vmaf_use_features_from_model(VmafContext *vmaf, VmafModel *model)
     RegisteredFeatureExtractors *rfe = &(vmaf->registered_feature_extractors);
 
     for (unsigned i = 0; i < model->n_features; i++) {
-        VmafFeatureExtractor *fex =
-            vmaf_get_feature_extractor_by_feature_name(model->feature[i].name,
-                                                       fex_flags);
+        VmafFeatureExtractor *fex = NULL;
+#ifdef HAVE_METAL
+        // Prefer a Metal feature extractor, fall back to the CPU when the
+        // feature has not been ported.
+        if (!vmaf->cfg.gpumask && vmaf->metal_state) {
+            fex = vmaf_get_feature_extractor_by_feature_name(
+                      model->feature[i].name,
+                      fex_flags | VMAF_FEATURE_EXTRACTOR_METAL);
+        }
+        if (!fex)
+#endif
+        fex = vmaf_get_feature_extractor_by_feature_name(model->feature[i].name,
+                                                         fex_flags);
         if (!fex) {
             vmaf_log(VMAF_LOG_LEVEL_ERROR,
                      "could not initialize feature extractor \"%s\"\n",
@@ -468,6 +514,9 @@ int vmaf_use_features_from_model(VmafContext *vmaf, VmafModel *model)
         err = vmaf_feature_extractor_context_create(&fex_ctx, fex, d);
 #ifdef HAVE_CUDA
         err |= set_fex_cuda_state(fex_ctx, vmaf);
+#endif
+#ifdef HAVE_METAL
+        err |= set_fex_metal_state(fex_ctx, vmaf);
 #endif
         err |= set_fex_framesync(fex_ctx, vmaf);
         if (err) return err;

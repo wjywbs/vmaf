@@ -500,6 +500,70 @@ if is_cuda_enabled
     common_cuda_objects += cuda_static_lib.extract_all_objects()
 endif
 
+metal_objects = []
+
+if is_metal_enabled
+    # Kernels are compiled offline into a single metallib that is embedded
+    # into libvmaf, see src/metal/common.m.
+    metal_kernel_sources = [
+        'metal/selftest.metal',
+    ]
+    metal_kernel_headers = files(
+        'metal/kernel_common.h',
+        'metal/soft_f64.h',
+    )
+    metal_kernel_args = [
+        '-std=metal3.1',
+        '-mmacosx-version-min=14.0',
+        '-fno-fast-math',
+        '-I', meson.current_source_dir() / 'metal',
+        '-I', meson.current_source_dir() / 'feature' / 'metal',
+    ]
+
+    metal_air = []
+    foreach k : metal_kernel_sources
+        metal_air += custom_target(
+            k.underscorify() + '_air',
+            input : k,
+            output : '@BASENAME@.air',
+            depend_files : metal_kernel_headers,
+            command : ['xcrun', '-sdk', 'macosx', 'metal', '-c',
+                       metal_kernel_args, '@INPUT@', '-o', '@OUTPUT@'],
+        )
+    endforeach
+
+    metallib = custom_target(
+        'vmaf_metallib',
+        input : metal_air,
+        output : 'vmaf.metallib',
+        command : ['xcrun', '-sdk', 'macosx', 'metallib', '@INPUT@',
+                   '-o', '@OUTPUT@'],
+    )
+
+    metallib_c = custom_target(
+        'vmaf_metallib_c',
+        input : metallib,
+        output : 'vmaf_metallib.c',
+        command : [find_program('xxd'), '-i', '-n', 'vmaf_metallib',
+                   '@INPUT@', '@OUTPUT@'],
+    )
+
+    metal_host_sources = [
+        'metal/common.m',
+    ]
+
+    metal_static_lib = static_library(
+        'metal_common_vmaf_lib',
+        [metal_host_sources, metallib_c],
+        include_directories : [libvmaf_include, vmaf_base_include,
+                               include_directories('metal')],
+        dependencies : [thread_lib, stdatomic_dependency],
+        objc_args : ['-fobjc-arc'],
+    )
+
+    metal_objects += metal_static_lib.extract_all_objects(recursive: true)
+endif
+
 math_lib = cc.find_library('m', required : false)
 
 vmaf_include = include_directories(
@@ -575,7 +639,7 @@ libvmaf_feature_static_lib = static_library(
     libvmaf_feature_sources,
     include_directories : [libvmaf_include, vmaf_include, cuda_dir],
     dependencies: [thread_lib, stdatomic_dependency, cuda_dependency, builtin_clz_dependency],
-    objects: common_cuda_objects
+    objects: common_cuda_objects + metal_objects
 )
 
 libsvm_cpp_args = vmaf_cflags_common

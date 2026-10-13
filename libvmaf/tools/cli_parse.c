@@ -41,6 +41,7 @@ enum {
     ARG_COLOR_TRC_DIST,
     ARG_COLOR_MATRIX_REF,
     ARG_COLOR_MATRIX_DIST,
+    ARG_METAL_FAST,
 };
 
 static const struct option long_opts[] = {
@@ -61,6 +62,7 @@ static const struct option long_opts[] = {
     { "subsample",        1, NULL, ARG_SUBSAMPLE },
     { "cpumask",          1, NULL, ARG_CPUMASK },
     { "gpumask",          1, NULL, ARG_GPUMASK },
+    { "metal_fast",       0, NULL, ARG_METAL_FAST },
     { "aom_ctc",          1, NULL, ARG_AOM_CTC },
     { "nflx_ctc",         1, NULL, ARG_NFLX_CTC },
     { "frame_cnt",        1, NULL, ARG_FRAME_CNT },
@@ -109,6 +111,7 @@ static void usage(const char *const app, const char *const reason, ...) {
             " --feature $string:           additional feature\n"
             " --cpumask: $bitmask          restrict permitted CPU instruction sets\n"
             " --gpumask: $bitmask          restrict permitted GPU operations\n"
+            " --metal_fast:                Metal fast mode, not bit-exact with CPU\n"
             " --frame_cnt $unsigned:       maximum number of frames to process\n"
             " --frame_skip_ref $unsigned:  skip the first N frames in reference\n"
             " --frame_skip_dist $unsigned: skip the first N frames in distorted\n"
@@ -659,6 +662,9 @@ void cli_parse(const int argc, char *const *const argv,
             break;
         case ARG_GPUMASK:
             settings->gpumask = parse_unsigned(optarg, ARG_GPUMASK, argv[0]);
+            break;
+        case ARG_METAL_FAST:
+            settings->metal_fast = true;
             break;
         case ARG_AOM_CTC:
             parse_aom_ctc(settings, optarg, argv[0]);

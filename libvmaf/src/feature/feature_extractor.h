@@ -39,6 +39,7 @@ enum VmafFeatureExtractorFlags {
     VMAF_FEATURE_EXTRACTOR_CUDA = 1 << 1,
     VMAF_FEATURE_FRAME_SYNC = 1 << 2,
     VMAF_FEATURE_EXTRACTOR_PREV_REF = 1 << 3,
+    VMAF_FEATURE_EXTRACTOR_METAL = 1 << 4,
 };
 
 struct VmafFeatureExtractorContext;
@@ -108,6 +109,8 @@ typedef struct VmafFeatureExtractor {
     #ifdef HAVE_CUDA
     VmafCudaState *cu_state; ///< VmafCudaState, set by framework
     #endif
+
+    struct VmafMetalState *metal_state; ///< VmafMetalState, set by framework (Metal builds only)
 
     VmafFrameSyncContext *framesync;
     VmafPicture prev_ref; ///< Previous reference picture (n-1), set by framework.

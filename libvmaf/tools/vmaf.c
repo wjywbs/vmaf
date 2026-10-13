@@ -24,6 +24,9 @@
 #ifdef HAVE_CUDA
 #include "libvmaf/libvmaf_cuda.h"
 #endif
+#ifdef HAVE_METAL
+#include "libvmaf/libvmaf_metal.h"
+#endif
 
 static enum VmafPixelFormat pix_fmt_map(int pf)
 {
@@ -189,6 +192,23 @@ int main(int argc, char *argv[])
             err |= vmaf_cuda_import_state(vmaf, cu_state);
             if (err) {
                 fprintf(stderr, "problem during vmaf_cuda_import_state\n");
+                return -1;
+            }
+        }
+    }
+#endif
+
+#ifdef HAVE_METAL
+    if (c.gpumask != ((unsigned)~0)) {
+        VmafMetalState *metal_state;
+        VmafMetalConfiguration metal_cfg = { .fast_math = c.metal_fast };
+        err = vmaf_metal_state_init(&metal_state, metal_cfg);
+        if (err) {
+            fprintf(stderr, "problem during vmaf_metal_state_init, using CPU\n");
+        } else {
+            err = vmaf_metal_import_state(vmaf, metal_state);
+            if (err) {
+                fprintf(stderr, "problem during vmaf_metal_import_state\n");
                 return -1;
             }
         }

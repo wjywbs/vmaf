@@ -15,6 +15,10 @@ if is_cuda_enabled
   platform_specific_headers += 'libvmaf_cuda.h'
 endif
 
+if is_metal_enabled
+  platform_specific_headers += 'libvmaf_metal.h'
+endif
+
 # install headers
 install_headers(['libvmaf.h',
                 'feature.h',

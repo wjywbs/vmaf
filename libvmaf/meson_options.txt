@@ -38,6 +38,11 @@ option('enable_cuda',
     value: false,
     description: 'Enable CUDA support')
 
+option('enable_metal',
+    type: 'boolean',
+    value: false,
+    description: 'Enable Apple Metal GPU support (macOS only)')
+
 option('enable_nvtx',
     type: 'boolean',
     value: false,

@@ -300,3 +300,28 @@ test_read_pictures_convert = executable('test_read_pictures_convert',
     link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
 )
 test('test_read_pictures_convert', test_read_pictures_convert)
+
+if is_metal_enabled
+    test_soft_f64 = executable('test_soft_f64',
+        ['test.c', 'test_soft_f64.c'],
+        include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+        dependencies : [math_lib],
+    )
+    test('test_soft_f64', test_soft_f64, timeout : 120)
+
+    test_metal = executable('test_metal',
+        ['test.c', 'test_metal.c'],
+        include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+        link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+        dependencies : [thread_lib, stdatomic_dependency],
+    )
+    test('test_metal', test_metal)
+
+    # Bit-exactness check of Metal vs CPU on real video, see doc/metal/.
+    vmaf_metal_compare = executable('vmaf_metal_compare',
+        ['metal/vmaf_metal_compare.c'],
+        include_directories : [libvmaf_inc, include_directories('../src/')],
+        link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+        dependencies : [thread_lib, stdatomic_dependency, math_lib],
+    )
+endif

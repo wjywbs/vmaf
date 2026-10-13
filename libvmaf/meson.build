@@ -174,6 +174,19 @@ else
     thread_lib = dependency('threads')
 endif
 
+is_metal_enabled = get_option('enable_metal') == true
+if is_metal_enabled
+    if host_machine.system() != 'darwin'
+        error('Metal support (-Denable_metal=true) requires macOS')
+    endif
+    add_languages('objc', required : true)
+    add_project_arguments('-DHAVE_METAL', language : ['c', 'cpp', 'objc'])
+    # Every target linking libvmaf (library, tools, tests) needs the
+    # frameworks used by the Metal backend.
+    add_project_link_arguments(['-framework', 'Metal', '-framework', 'Foundation'],
+                               language : ['c', 'cpp', 'objc'])
+endif
+
 subdir('include')
 subdir('src')
 subdir('tools')
