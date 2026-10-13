@@ -33,6 +33,7 @@
 typedef ulong sf_u64;
 typedef long sf_i64;
 typedef int sf_i32;
+#define SF_U64_C(x) x##ul
 static inline sf_u64 sf_mulhi(sf_u64 a, sf_u64 b) { return mulhi(a, b); }
 static inline sf_i32 sf_clz64(sf_u64 x) { return (sf_i32)clz(x); }
 #else
@@ -41,6 +42,7 @@ static inline sf_i32 sf_clz64(sf_u64 x) { return (sf_i32)clz(x); }
 typedef uint64_t sf_u64;
 typedef int64_t sf_i64;
 typedef int32_t sf_i32;
+#define SF_U64_C(x) x##ull
 static inline sf_u64 sf_mulhi(sf_u64 a, sf_u64 b)
 {
     return (sf_u64)(((unsigned __int128)a * b) >> 64);
@@ -136,9 +138,40 @@ static inline sf64 sf_zero(void)
  * below the least significant bit of M, it requires M to carry at least two
  * bits more than the target precision.
  */
+/** sf_round() of a 64 bit M */
+static inline sf64 sf_round64(sf_u64 M, sf_i32 E, bool sticky, sf_i32 s)
+{
+    if (!M) return sf_zero();
+
+    const sf_i32 p = 63 - sf_clz64(M);
+    sf64 r;
+    r.s = s;
+    if (p <= 52) {
+        r.m = M << (52 - p);
+        r.e = E - (52 - p);
+        return r;
+    }
+
+    const sf_i32 sh = p - 52;
+    sf_u64 q = M >> sh;
+    const bool guard = ((M >> (sh - 1)) & 1) != 0;
+    const bool rest = sticky || (M & ((((sf_u64)1) << (sh - 1)) - 1)) != 0;
+    sf_i32 e = E + sh;
+    if (guard && (rest || (q & 1))) {
+        q++;
+        if (q == ((sf_u64)1 << 53)) {
+            q >>= 1;
+            e++;
+        }
+    }
+    r.m = q;
+    r.e = e;
+    return r;
+}
+
 static inline sf64 sf_round(sf_u128 M, sf_i32 E, bool sticky, sf_i32 s)
 {
-    if (!M.hi && !M.lo) return sf_zero();
+    if (!M.hi) return sf_round64(M.lo, E, sticky, s);
 
     const sf_i32 p = 127 - sf_u128_clz(M);
     sf64 r;
@@ -185,15 +218,28 @@ static inline sf_u64 sf_to_bits(sf64 a)
            (a.m & (((sf_u64)1 << 52) - 1));
 }
 
+static inline sf64 sf_from_mag(sf_u64 x, sf_i32 s)
+{
+    if (x >> 53) return sf_round(sf_u128_make(0, x), 0, false, s);
+    if (!x) return sf_zero();
+    // exact, no rounding
+    const sf_i32 sh = sf_clz64(x) - 11;
+    sf64 r;
+    r.m = x << sh;
+    r.e = -sh;
+    r.s = s;
+    return r;
+}
+
 static inline sf64 sf_from_u64(sf_u64 x)
 {
-    return sf_round(sf_u128_make(0, x), 0, false, 0);
+    return sf_from_mag(x, 0);
 }
 
 static inline sf64 sf_from_i64(sf_i64 x)
 {
-    if (x < 0) return sf_round(sf_u128_make(0, (sf_u64)0 - (sf_u64)x), 0, false, 1);
-    return sf_from_u64((sf_u64)x);
+    if (x < 0) return sf_from_mag((sf_u64)0 - (sf_u64)x, 1);
+    return sf_from_mag((sf_u64)x, 0);
 }
 
 static inline sf64 sf_neg(sf64 a)
@@ -254,8 +300,27 @@ static inline sf64 sf_add_exact(sf_u128 A, sf_i32 Ea, sf_i32 sa,
 
 static inline sf64 sf_add(sf64 a, sf64 b)
 {
-    return sf_add_exact(sf_u128_make(0, a.m), a.e, a.s,
-                        sf_u128_make(0, b.m), b.e, b.s);
+    if (!b.m) return a.m ? a : sf_zero();
+    if (!a.m) return b;
+    // |a| >= |b|
+    if (a.e < b.e || (a.e == b.e && a.m < b.m)) {
+        const sf64 t = a;
+        a = b;
+        b = t;
+    }
+    // 10 guard bits: X < 2^63, Y aligned to X with sticky
+    const sf_i32 d = a.e - b.e;
+    const sf_u64 X = a.m << 10;
+    const sf_u64 B = b.m << 10;
+    sf_u64 Y = 0;
+    bool sticky = true;
+    if (d < 64) {
+        Y = B >> d;
+        sticky = d > 0 && (B & ((((sf_u64)1) << d) - 1)) != 0;
+    }
+    if (a.s == b.s) return sf_round64(X + Y, a.e - 10, sticky, a.s);
+    // with sticky, d > 10 and X - Y > 2^61: enough bits for rounding
+    return sf_round64(X - Y - (sticky ? 1 : 0), a.e - 10, sticky, a.s);
 }
 
 static inline sf64 sf_sub(sf64 a, sf64 b)
@@ -266,7 +331,11 @@ static inline sf64 sf_sub(sf64 a, sf64 b)
 static inline sf64 sf_mul(sf64 a, sf64 b)
 {
     if (!a.m || !b.m) return sf_zero();
-    return sf_round(sf_mul64(a.m, b.m), a.e + b.e, false, a.s ^ b.s);
+    // product in [2^104, 2^106): round its top 56 bits plus sticky
+    const sf_u64 hi = sf_mulhi(a.m, b.m), lo = a.m * b.m;
+    const sf_u64 M = (hi << 14) | (lo >> 50);
+    const bool sticky = (lo & ((((sf_u64)1) << 50) - 1)) != 0;
+    return sf_round64(M, a.e + b.e + 50, sticky, a.s ^ b.s);
 }
 
 /** fma(a, b, c) = a * b + c with a single rounding */
@@ -280,15 +349,31 @@ static inline sf64 sf_fma(sf64 a, sf64 b, sf64 c)
 static inline sf64 sf_div(sf64 a, sf64 b)
 {
     if (!a.m) return sf_zero();
-    // restoring division: q = floor(a.m * 2^55 / b.m), 55 or 56 bits
+    /**
+     * Long division q = floor(a.m * 2^55 / b.m), 55 or 56 bits: one leading
+     * bit, then five 11 bit digits. The remainder stays below b.m < 2^53, so
+     * remainder << 11 fits 64 bits. Each digit is estimated with a float
+     * reciprocal: the estimate of r / b.m < 2^11 has a relative error below
+     * 2^-20, so lowering it by 2^-8 yields the exact digit or one less, fixed
+     * by one correction step.
+     */
+    const sf_u64 d = b.m;
+    const float inv = 1.0f / (float)d;
     sf_u64 r = a.m, q = 0;
-    for (int i = 0; i < 56; i++) {
-        q <<= 1;
-        if (r >= b.m) {
-            r -= b.m;
-            q |= 1;
+    if (r >= d) {
+        r -= d;
+        q = 1;
+    }
+    for (int i = 0; i < 5; i++) {
+        r <<= 11;
+        const float est = (float)r * inv - 0.00390625f;
+        sf_u64 digit = est > 0.0f ? (sf_u64)est : 0;
+        r -= digit * d;
+        if (r >= d) {
+            r -= d;
+            digit++;
         }
-        r <<= 1;
+        q = (q << 11) | digit;
     }
     return sf_round(sf_u128_make(0, q), a.e - b.e - 55, r != 0, a.s ^ b.s);
 }

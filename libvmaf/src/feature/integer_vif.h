@@ -78,6 +78,33 @@ typedef struct VifResiduals {
     int64_t accum_den_non_log;
 } VifResiduals;
 
+typedef struct VifScore {
+    struct {
+        float num;
+        float den;
+    } scale[4];
+} VifScore;
+
+/*
+ * Convert the integer residuals of one scale into num and den.
+ */
+static inline void vif_residuals_to_score(VifResiduals r, float *num, float *den)
+{
+    *num = r.accum_num_log / 2048.0 + (r.accum_den_non_log -
+           ((r.accum_num_non_log) / 16384.0) / (65025.0));
+    *den = r.accum_den_log / 2048.0 + r.accum_den_non_log;
+}
+
+struct VmafFeatureCollector;
+struct VmafDictionary;
+
+/*
+ * Write the vif feature scores of picture `index` to the feature collector.
+ */
+int vif_write_scores(struct VmafFeatureCollector *feature_collector,
+                     struct VmafDictionary *feature_name_dict, unsigned index,
+                     VifScore vif, bool vif_skip_scale0, bool debug);
+
 typedef struct VifPublicState {
     VifBuffer buf;
     uint16_t log2_table[65537];

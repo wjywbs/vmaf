@@ -121,7 +121,24 @@ static char *test_add_sub()
 static char *test_mul_div()
 {
     for (unsigned i = 0; i < N_ITER; i++) {
-        const double a = rand_double(200), b = rand_double(200);
+        double a = rand_double(200), b = rand_double(200);
+        switch (i % 6) {
+        case 0: // exact quotients, zero remainder
+            a = b * (double)(rng() % 4096 + 1);
+            break;
+        case 1: // quotient close to 1, 2 or a power of two
+            a = b * (double)(1 << (rng() % 3)) *
+                (1.0 + (double)((int)(rng() % 64) - 32) * 0x1p-52);
+            break;
+        case 2: // extreme mantissas
+            a = from_bits((to_bits(a) & ~((1ull << 52) - 1)) |
+                          ((rng() & 1) ? ((1ull << 52) - 1) : 0));
+            b = from_bits((to_bits(b) & ~((1ull << 52) - 1)) |
+                          ((rng() & 1) ? ((1ull << 52) - 1) : rng() % 8));
+            break;
+        default:
+            break;
+        }
         const volatile double mul = a * b, div = a / b;
         if (to_bits(df(sf_mul(sf(a), sf(b)))) != to_bits(mul)) {
             mismatch("mul", a, b, 0, mul, df(sf_mul(sf(a), sf(b))));

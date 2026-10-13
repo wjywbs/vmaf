@@ -159,6 +159,12 @@ static char *test_metal_soft_f64()
                 y = -x * (1.0 + (double)(rng() % 64) * 0x1p-52);
             if (op == VMAF_METAL_SOFT_F64_FMA && i % 2 == 0)
                 z = -(x * y);
+            if (op == VMAF_METAL_SOFT_F64_DIV && i % 3 == 0) {
+                // exact quotients and quotients close to 1, 2, 4
+                x = i % 2 ? y * (double)(rng() % 4096 + 1) :
+                    y * (double)(1 << (rng() % 3)) *
+                    (1.0 + (double)((int)(rng() % 64) - 32) * 0x1p-52);
+            }
             a[i] = op == VMAF_METAL_SOFT_F64_FROM_I64 ?
                    (uint64_t)((int64_t)rng() >> (rng() % 64)) : to_bits(x);
             b[i] = to_bits(y);

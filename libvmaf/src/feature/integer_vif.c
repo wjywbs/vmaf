@@ -685,45 +685,39 @@ fail:
     return -ENOMEM;
 }
 
-typedef struct VifScore {
-    struct {
-        float num;
-        float den;
-    } scale[4];
-} VifScore;
-
-static int write_scores(VmafFeatureCollector *feature_collector, unsigned index,
-                        VifScore vif, VifState *s)
+int vif_write_scores(VmafFeatureCollector *feature_collector,
+                     VmafDictionary *feature_name_dict, unsigned index,
+                     VifScore vif, bool vif_skip_scale0, bool debug)
 {
     int err = 0;
 
-    if (s->vif_skip_scale0) {
+    if (vif_skip_scale0) {
         err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "VMAF_integer_feature_vif_scale0_score",
+            feature_name_dict, "VMAF_integer_feature_vif_scale0_score",
             0.0f, index);
     } else {
         err |= vmaf_feature_collector_append_with_dict(feature_collector,
-                s->feature_name_dict, "VMAF_integer_feature_vif_scale0_score",
+                feature_name_dict, "VMAF_integer_feature_vif_scale0_score",
                 vif.scale[0].num / vif.scale[0].den, index);
     }
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "VMAF_integer_feature_vif_scale1_score",
+            feature_name_dict, "VMAF_integer_feature_vif_scale1_score",
             vif.scale[1].num / vif.scale[1].den, index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "VMAF_integer_feature_vif_scale2_score",
+            feature_name_dict, "VMAF_integer_feature_vif_scale2_score",
             vif.scale[2].num / vif.scale[2].den, index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "VMAF_integer_feature_vif_scale3_score",
+            feature_name_dict, "VMAF_integer_feature_vif_scale3_score",
             vif.scale[3].num / vif.scale[3].den, index);
 
-    if (!s->debug) return err;
+    if (!debug) return err;
 
     double score_num, score_den;
 
-    if (s->vif_skip_scale0) {
+    if (vif_skip_scale0) {
         score_num = (double)vif.scale[1].num + (double)vif.scale[2].num + (double)vif.scale[3].num;
         score_den = (double)vif.scale[1].den + (double)vif.scale[2].den + (double)vif.scale[3].den;
     } else {
@@ -740,54 +734,54 @@ static int write_scores(VmafFeatureCollector *feature_collector, unsigned index,
         score_den == 0.0 ? 1.0f : score_num / score_den;
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif", score, index);
+            feature_name_dict, "integer_vif", score, index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_num", score_num, index);
+            feature_name_dict, "integer_vif_num", score_num, index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_den", score_den, index);
+            feature_name_dict, "integer_vif_den", score_den, index);
 
-    if (s->vif_skip_scale0) {
+    if (vif_skip_scale0) {
         err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_num_scale0", 0.0f,
+            feature_name_dict, "integer_vif_num_scale0", 0.0f,
             index);
 
         err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_den_scale0", -1.0f,
+            feature_name_dict, "integer_vif_den_scale0", -1.0f,
             index);
     } else {
         err |= vmaf_feature_collector_append_with_dict(feature_collector,
-                s->feature_name_dict, "integer_vif_num_scale0", vif.scale[0].num,
+                feature_name_dict, "integer_vif_num_scale0", vif.scale[0].num,
                 index);
 
         err |= vmaf_feature_collector_append_with_dict(feature_collector,
-                s->feature_name_dict, "integer_vif_den_scale0", vif.scale[0].den,
+                feature_name_dict, "integer_vif_den_scale0", vif.scale[0].den,
                 index);
     }
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_num_scale1", vif.scale[1].num,
+            feature_name_dict, "integer_vif_num_scale1", vif.scale[1].num,
             index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_den_scale1", vif.scale[1].den,
+            feature_name_dict, "integer_vif_den_scale1", vif.scale[1].den,
             index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_num_scale2", vif.scale[2].num,
+            feature_name_dict, "integer_vif_num_scale2", vif.scale[2].num,
             index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_den_scale2", vif.scale[2].den,
+            feature_name_dict, "integer_vif_den_scale2", vif.scale[2].den,
             index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_num_scale3", vif.scale[3].num,
+            feature_name_dict, "integer_vif_num_scale3", vif.scale[3].num,
             index);
 
     err |= vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict, "integer_vif_den_scale3", vif.scale[3].den,
+            feature_name_dict, "integer_vif_den_scale3", vif.scale[3].den,
             index);
 
     return err;
@@ -846,7 +840,8 @@ static int extract(VmafFeatureExtractor *fex,
 
     }
 
-    return write_scores(feature_collector, index, vif_score, s);
+    return vif_write_scores(feature_collector, s->feature_name_dict, index,
+                            vif_score, s->vif_skip_scale0, s->debug);
 }
 
 static int close(VmafFeatureExtractor *fex)

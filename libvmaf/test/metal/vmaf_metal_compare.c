@@ -27,7 +27,8 @@
  *            [--feature name]... [--model version] [--frames n]
  *            [--threads n] [--fast] [--tol x]
  *
- *   --feature vif   compares CPU "vif" with "vif_metal"
+ *   --feature vif   compares CPU "vif" with "vif_metal", options are
+ *                   passed as --feature vif:debug=true:vif_enhn_gain_limit=1.0
  *   --model v       compares the features (and score) of built-in model v,
  *                   the Metal context prefers Metal feature extractors
  *   --fast          Metal fast mode, report differences, fail above --tol
@@ -47,10 +48,12 @@
 #include "libvmaf/libvmaf.h"
 #include "libvmaf/libvmaf_metal.h"
 #include "libvmaf/model.h"
+#include "dict.h"
 #include "feature/feature_extractor.h"
+#include "feature/feature_name.h"
 
 #define MAX_FEATURES 32
-#define MAX_NAMES 256
+#define MAX_NAMES 1024
 
 typedef struct {
     FILE *f;
@@ -203,10 +206,44 @@ int main(int argc, char **argv)
     }
 
     for (unsigned i = 0; i < n_features; i++) {
-        char metal_name[256];
-        snprintf(metal_name, sizeof(metal_name), "%s_metal", features[i]);
-        err |= vmaf_use_feature(cpu, features[i], NULL);
-        err |= vmaf_use_feature(gpu, metal_name, NULL);
+        // name[:key=value]...
+        char spec[256], metal_name[256];
+        snprintf(spec, sizeof(spec), "%s", features[i]);
+        char *opts = strchr(spec, ':');
+        if (opts) *opts++ = '\0';
+        snprintf(metal_name, sizeof(metal_name), "%s_metal", spec);
+
+        VmafFeatureDictionary *d_cpu = NULL, *d_gpu = NULL, *d_name = NULL;
+        for (char *kv = opts ? strtok(opts, ":") : NULL; kv;
+             kv = strtok(NULL, ":")) {
+            char *val = strchr(kv, '=');
+            if (!val) usage(argv[0]);
+            *val++ = '\0';
+            err |= vmaf_feature_dictionary_set(&d_cpu, kv, val);
+            err |= vmaf_feature_dictionary_set(&d_gpu, kv, val);
+            err |= vmaf_feature_dictionary_set(&d_name, kv, val);
+        }
+        // Options can add a suffix to the output names (e.g. "_egl_1"),
+        // derive them as the extractor does.
+        VmafFeatureExtractor *fex = vmaf_get_feature_extractor_by_name(spec);
+        if (fex && fex->provided_features) {
+            VmafFeatureExtractorContext *fex_ctx = NULL;
+            err |= vmaf_feature_extractor_context_create(&fex_ctx, fex,
+                                                    (VmafDictionary *)d_name);
+            if (!err && fex_ctx->fex->priv) {
+                for (unsigned j = 0; fex->provided_features[j]; j++) {
+                    char *fn = vmaf_feature_name_from_options(
+                        fex->provided_features[j], fex->options,
+                        fex_ctx->fex->priv);
+                    if (fn && n_names < MAX_NAMES) names[n_names++] = fn;
+                }
+            }
+            if (fex_ctx) vmaf_feature_extractor_context_destroy(fex_ctx);
+        } else if (d_name) {
+            vmaf_feature_dictionary_free(&d_name);
+        }
+        err |= vmaf_use_feature(cpu, spec, d_cpu);
+        err |= vmaf_use_feature(gpu, metal_name, d_gpu);
         if (err) {
             fprintf(stderr, "problem using feature %s / %s\n", features[i],
                     metal_name);

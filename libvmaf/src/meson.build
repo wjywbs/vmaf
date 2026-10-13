@@ -507,10 +507,12 @@ if is_metal_enabled
     # into libvmaf, see src/metal/common.m.
     metal_kernel_sources = [
         'metal/selftest.metal',
+        'feature/metal/integer_vif.metal',
     ]
     metal_kernel_headers = files(
         'metal/kernel_common.h',
         'metal/soft_f64.h',
+        'feature/metal/integer_vif_metal.h',
     )
     metal_kernel_args = [
         '-std=metal3.1',
@@ -550,13 +552,14 @@ if is_metal_enabled
 
     metal_host_sources = [
         'metal/common.m',
+        'feature/metal/integer_vif_metal.m',
     ]
 
     metal_static_lib = static_library(
         'metal_common_vmaf_lib',
         [metal_host_sources, metallib_c],
         include_directories : [libvmaf_include, vmaf_base_include,
-                               include_directories('metal')],
+                               include_directories('metal', 'feature/metal')],
         dependencies : [thread_lib, stdatomic_dependency],
         objc_args : ['-fobjc-arc'],
     )
