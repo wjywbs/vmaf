@@ -2,11 +2,13 @@
 #
 # Benchmark Metal feature extraction against the CPU baseline.
 #
-# usage: test/metal/bench.sh <feature|model> [frames]
+# usage: test/metal/bench.sh <feature[=options]|model> [frames]
 #
-#   feature: CPU "--feature X --no_prediction" vs Metal "--feature X_metal"
-#   model:   default model; CPU build vs Metal build (Metal extractors are
-#            preferred, unported features fall back to the CPU)
+#   feature: CPU "--feature X --no_prediction" vs Metal "--feature X_metal",
+#            options as in "--feature X=key=value:..."
+#   model:   $MODEL (default: the default model); CPU build vs Metal build
+#            (Metal extractors are preferred, unported features fall back
+#            to the CPU)
 #
 # Environment (paths relative to libvmaf/):
 #   CPU_VMAF    CPU baseline binary      (default: build/tools/vmaf)
@@ -16,6 +18,7 @@
 #   THREAD_LIST thread counts to run     (default: "1 $THREADS"; 0 runs
 #               the extractors on the calling thread, the CLI default)
 #   RUNS        runs per config, best is reported (default: 1)
+#   MODEL       model for "model", e.g. "version=vmaf_v1.0.16_3d0h"
 #
 # Prints a markdown table.
 
@@ -64,11 +67,14 @@ if [ -z "$n_frames" ]; then
 fi
 
 if [ "$MODE" = model ]; then
-    cpu_args=""
-    metal_args=""
+    cpu_args=${MODEL:+--model $MODEL}
+    metal_args=$cpu_args
 else
+    name=${MODE%%=*}
+    opts=""
+    [ "$name" != "$MODE" ] && opts="=${MODE#*=}"
     cpu_args="--no_prediction --feature $MODE"
-    metal_args="--no_prediction --feature ${MODE}_metal"
+    metal_args="--no_prediction --feature ${name}_metal$opts"
 fi
 
 echo "| config | threads | time (s) | fps | speedup vs CPU |"

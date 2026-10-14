@@ -132,11 +132,15 @@ Why exact needs work: Metal has no fp64, but integer VIF computes a per-pixel `d
 
 ### Step 5: CAMBI (`cambi_metal`) → `doc/metal/5-cambi.md` (0.74 s/60 frames; heaviest optional feature)
 - Port the per-scale decimation, spatial mask, and sliding-window histogram/c-value computation from `cambi.c`. It is integer or float-deterministic, and exact match is required.
+- The vmaf_v1.0.16 models (`vmaf_v1.0.16_3d0h`, `_hfr_3d0h`, ...) use CAMBI, so they are benchmarked too.
 
-### Step 6: float_ssim / float_ms_ssim → `doc/metal/6-ssim.md`
+### Step 6: speed_chroma (`speed_chroma_metal`) → `doc/metal/6-speed-chroma.md`
+- The other CPU feature of the vmaf_v1.0.16 models. Follow-up to step 5, benchmarked on the same models.
+
+### Step 7: float_ssim / float_ms_ssim → `doc/metal/7-ssim.md`
 - Gaussian filtering and SSIM maps in float. Exact mode reproduces the CPU's float evaluation order; fast mode allows FMA and reordering.
 
-PSNR, ciede, and speed are cheap or niche and are left out of scope (noted in the step 6 doc).
+PSNR, ciede, and the other speed features are cheap or niche and are left out of scope (noted in the step 7 doc).
 
 ## Critical files
 - **Modify:**

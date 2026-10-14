@@ -510,6 +510,7 @@ if is_metal_enabled
         'feature/metal/integer_vif.metal',
         'feature/metal/integer_adm.metal',
         'feature/metal/integer_motion.metal',
+        'feature/metal/cambi.metal',
     ]
     metal_kernel_headers = files(
         'metal/kernel_common.h',
@@ -517,6 +518,7 @@ if is_metal_enabled
         'feature/metal/integer_vif_metal.h',
         'feature/metal/integer_adm_metal.h',
         'feature/metal/integer_motion_metal.h',
+        'feature/metal/cambi_metal.h',
     )
     metal_kernel_args = [
         '-std=metal3.1',
@@ -559,6 +561,7 @@ if is_metal_enabled
         'feature/metal/integer_vif_metal.m',
         'feature/metal/integer_adm_metal.m',
         'feature/metal/integer_motion_metal.m',
+        'feature/metal/cambi_metal.m',
     ]
 
     metal_static_lib = static_library(
