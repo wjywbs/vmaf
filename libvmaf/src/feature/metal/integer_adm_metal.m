@@ -51,16 +51,17 @@ typedef struct AdmStateMetal {
 
     VmafDictionary *feature_name_dict;
     VmafMetalState *ms;
+    VmafMetalFrames frames;
     unsigned w, h, bpc;
     AdmMetalParams params[4];
     float rfactor[4][3];
     unsigned den_rows, cm_rows;
 
     // id<MTLBuffer>, retained
-    void *src_ref, *src_dis;
+    void *src_ref[VMAF_METAL_FRAMES], *src_dis[VMAF_METAL_FRAMES];
     void *ref_a[2], *dis_a[2]; // low-pass bands, scale s writes [s & 1]
     void *dec;                 // decouple planes r_h, r_v, r_d, a_h, a_v, a_d
-    void *den_out, *cm_out;    // per row sums
+    void *den_out[VMAF_METAL_FRAMES], *cm_out[VMAF_METAL_FRAMES]; // per row sums
 } AdmStateMetal;
 
 static const VmafOption options[] = {
@@ -399,10 +400,15 @@ static inline id<MTLBuffer> B(void *buf)
 
 static void buffers_free(AdmStateMetal *s)
 {
+    vmaf_metal_frames_close(&s->frames);
     void **bufs[] = {
-        &s->src_ref, &s->src_dis, &s->ref_a[0], &s->ref_a[1], &s->dis_a[0],
-        &s->dis_a[1], &s->dec, &s->den_out, &s->cm_out,
+        &s->src_ref[0], &s->src_ref[1], &s->src_ref[2],
+        &s->src_dis[0], &s->src_dis[1], &s->src_dis[2],
+        &s->den_out[0], &s->den_out[1], &s->den_out[2],
+        &s->cm_out[0], &s->cm_out[1], &s->cm_out[2],
+        &s->ref_a[0], &s->ref_a[1], &s->dis_a[0], &s->dis_a[1], &s->dec,
     };
+    _Static_assert(VMAF_METAL_FRAMES == 3, "update bufs[]");
     for (unsigned i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
         if (*bufs[i]) CFRelease(*bufs[i]);
         *bufs[i] = NULL;
@@ -458,17 +464,22 @@ static int init_fex(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 
     const size_t bpp = bpc > 8 ? 2 : 1;
     const size_t band = (size_t)s->params[0].w * s->params[0].h;
-    s->src_ref = buffer_new(s->ms, (size_t)w * h * bpp);
-    s->src_dis = buffer_new(s->ms, (size_t)w * h * bpp);
+    if (vmaf_metal_frames_init(&s->frames, s->ms)) goto fail;
+    bool ok = true;
+    for (int k = 0; k < VMAF_METAL_FRAMES; k++) {
+        s->src_ref[k] = buffer_new(s->ms, (size_t)w * h * bpp);
+        s->src_dis[k] = buffer_new(s->ms, (size_t)w * h * bpp);
+        s->den_out[k] = buffer_new(s->ms, s->den_rows * ADM_METAL_N_DEN * sizeof(uint64_t));
+        s->cm_out[k] = buffer_new(s->ms, s->cm_rows * ADM_METAL_N_CM * sizeof(int64_t));
+        ok = ok && s->src_ref[k] && s->src_dis[k] && s->den_out[k] && s->cm_out[k];
+    }
     for (int k = 0; k < 2; k++) {
         s->ref_a[k] = buffer_new(s->ms, band * sizeof(int32_t));
         s->dis_a[k] = buffer_new(s->ms, band * sizeof(int32_t));
     }
     s->dec = buffer_new(s->ms, 6 * band * sizeof(int32_t));
-    s->den_out = buffer_new(s->ms, s->den_rows * ADM_METAL_N_DEN * sizeof(uint64_t));
-    s->cm_out = buffer_new(s->ms, s->cm_rows * ADM_METAL_N_CM * sizeof(int64_t));
-    if (!s->src_ref || !s->src_dis || !s->ref_a[0] || !s->ref_a[1] ||
-        !s->dis_a[0] || !s->dis_a[1] || !s->dec || !s->den_out || !s->cm_out)
+    if (!ok || !s->ref_a[0] || !s->ref_a[1] || !s->dis_a[0] || !s->dis_a[1] ||
+        !s->dec)
         goto fail;
 
     s->feature_name_dict =
@@ -544,69 +555,12 @@ static int write_scores(const AdmStateMetal *s, const AdmScore *out,
     return err;
 }
 
-static int extract_fex(VmafFeatureExtractor *fex,
-                       VmafPicture *ref_pic, VmafPicture *ref_pic_90,
-                       VmafPicture *dist_pic, VmafPicture *dist_pic_90,
-                       unsigned index, VmafFeatureCollector *feature_collector)
+/** integer_compute_adm(), from the row sums of frame slot `slot`. */
+static int compute_scores(const AdmStateMetal *s, unsigned slot,
+                          unsigned index, VmafFeatureCollector *feature_collector)
 {
-    AdmStateMetal *s = fex->priv;
-    (void)ref_pic_90;
-    (void)dist_pic_90;
-
-    // current implementation is limited by the 16-bit data pipeline, thus
-    // cannot handle an angular frequency smaller than 1080p * 3H
-    if (s->adm_norm_view_dist * s->adm_ref_display_height <
-        DEFAULT_ADM_NORM_VIEW_DIST * DEFAULT_ADM_REF_DISPLAY_HEIGHT)
-        return -EINVAL;
-
-    const size_t bpp = s->bpc > 8 ? 2 : 1;
-    vmaf_metal_copy_plane(B(s->src_ref).contents, s->w * bpp, ref_pic, 0);
-    vmaf_metal_copy_plane(B(s->src_dis).contents, s->w * bpp, dist_pic, 0);
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cb = [vmaf_metal_queue(s->ms) commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-
-        for (int scale = 0; scale < 4; scale++) {
-            const AdmMetalParams *p = &s->params[scale];
-            const bool lo_only = scale == 0 && s->adm_skip_scale0;
-            const uint32_t variant = scale | (scale == 0 ? s->bpc << 8 : 0);
-            id<MTLComputePipelineState> dwt = vmaf_metal_pipeline(s->ms,
-                "adm_metal_dwt", variant | (lo_only ? ADM_METAL_VARIANT_LO_ONLY : 0));
-            id<MTLComputePipelineState> cm = vmaf_metal_pipeline(s->ms,
-                "adm_metal_cm", variant | (s->adm_skip_aim ? ADM_METAL_VARIANT_SKIP_AIM : 0));
-            if (!dwt || !cm) {
-                [enc endEncoding];
-                return -EINVAL;
-            }
-
-            [enc setBytes:p length:sizeof(*p) atIndex:0];
-            [enc setBuffer:B(scale ? s->ref_a[(scale - 1) & 1] : s->src_ref) offset:0 atIndex:1];
-            [enc setBuffer:B(scale ? s->dis_a[(scale - 1) & 1] : s->src_dis) offset:0 atIndex:2];
-            [enc setBuffer:B(s->ref_a[scale & 1]) offset:0 atIndex:3];
-            [enc setBuffer:B(s->dis_a[scale & 1]) offset:0 atIndex:4];
-            [enc setBuffer:B(s->dec) offset:0 atIndex:5];
-            [enc setBuffer:B(s->den_out) offset:0 atIndex:6];
-            dispatch_rows(enc, dwt, p->h, p->w);
-            if (lo_only) continue;
-
-            [enc setBuffer:B(s->dec) offset:0 atIndex:1];
-            [enc setBuffer:B(s->cm_out) offset:0 atIndex:2];
-            dispatch_rows(enc, cm, p->bottom - p->top, p->right - p->left);
-        }
-
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-        if (cb.status != MTLCommandBufferStatusCompleted) {
-            vmaf_log(VMAF_LOG_LEVEL_ERROR, "adm_metal: command buffer failed\n");
-            return -EIO;
-        }
-    }
-
-    // integer_compute_adm()
-    const uint64_t *den_rows = B(s->den_out).contents;
-    const int64_t *cm_rows = B(s->cm_out).contents;
+    const uint64_t *den_rows = B(s->den_out[slot]).contents;
+    const int64_t *cm_rows = B(s->cm_out[slot]).contents;
     double num = 0, den = 0, aim_num = 0;
     AdmScore out = { 0 };
     for (int scale = 0; scale < 4; scale++) {
@@ -645,6 +599,69 @@ static int extract_fex(VmafFeatureExtractor *fex,
     out.den = den_v;
 
     return write_scores(s, &out, index, feature_collector);
+}
+
+static int extract_fex(VmafFeatureExtractor *fex,
+                       VmafPicture *ref_pic, VmafPicture *ref_pic_90,
+                       VmafPicture *dist_pic, VmafPicture *dist_pic_90,
+                       unsigned index, VmafFeatureCollector *feature_collector)
+{
+    AdmStateMetal *s = fex->priv;
+    (void)ref_pic_90;
+    (void)dist_pic_90;
+
+    // current implementation is limited by the 16-bit data pipeline, thus
+    // cannot handle an angular frequency smaller than 1080p * 3H
+    if (s->adm_norm_view_dist * s->adm_ref_display_height <
+        DEFAULT_ADM_NORM_VIEW_DIST * DEFAULT_ADM_REF_DISPLAY_HEIGHT)
+        return -EINVAL;
+
+    id<MTLComputePipelineState> dwt[4], cm[4];
+    for (int scale = 0; scale < 4; scale++) {
+        const bool lo_only = scale == 0 && s->adm_skip_scale0;
+        const uint32_t variant = scale | (scale == 0 ? s->bpc << 8 : 0);
+        dwt[scale] = vmaf_metal_pipeline(s->ms, "adm_metal_dwt",
+            variant | (lo_only ? ADM_METAL_VARIANT_LO_ONLY : 0));
+        cm[scale] = vmaf_metal_pipeline(s->ms, "adm_metal_cm",
+            variant | (s->adm_skip_aim ? ADM_METAL_VARIANT_SKIP_AIM : 0));
+        if (!dwt[scale] || !cm[scale]) return -EINVAL;
+    }
+
+    const unsigned slot = vmaf_metal_frames_acquire(&s->frames);
+    const size_t bpp = s->bpc > 8 ? 2 : 1;
+    vmaf_metal_copy_plane(B(s->src_ref[slot]).contents, s->w * bpp, ref_pic, 0);
+    vmaf_metal_copy_plane(B(s->src_dis[slot]).contents, s->w * bpp, dist_pic, 0);
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [vmaf_metal_queue(s->ms) commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        for (int scale = 0; scale < 4; scale++) {
+            const AdmMetalParams *p = &s->params[scale];
+            const bool lo_only = scale == 0 && s->adm_skip_scale0;
+
+            [enc setBytes:p length:sizeof(*p) atIndex:0];
+            [enc setBuffer:B(scale ? s->ref_a[(scale - 1) & 1] : s->src_ref[slot]) offset:0 atIndex:1];
+            [enc setBuffer:B(scale ? s->dis_a[(scale - 1) & 1] : s->src_dis[slot]) offset:0 atIndex:2];
+            [enc setBuffer:B(s->ref_a[scale & 1]) offset:0 atIndex:3];
+            [enc setBuffer:B(s->dis_a[scale & 1]) offset:0 atIndex:4];
+            [enc setBuffer:B(s->dec) offset:0 atIndex:5];
+            [enc setBuffer:B(s->den_out[slot]) offset:0 atIndex:6];
+            dispatch_rows(enc, dwt[scale], p->h, p->w);
+            if (lo_only) continue;
+
+            [enc setBuffer:B(s->dec) offset:0 atIndex:1];
+            [enc setBuffer:B(s->cm_out[slot]) offset:0 atIndex:2];
+            dispatch_rows(enc, cm[scale], p->bottom - p->top, p->right - p->left);
+        }
+
+        [enc endEncoding];
+        vmaf_metal_frames_commit(&s->frames, slot, cb, ^int(int err) {
+            if (err) return err;
+            return compute_scores(s, slot, index, feature_collector);
+        });
+    }
+    return 0;
 }
 
 static int close_fex(VmafFeatureExtractor *fex)

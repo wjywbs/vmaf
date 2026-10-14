@@ -13,6 +13,8 @@
 #   METAL_VMAF  Metal-enabled binary     (default: build-metal/tools/vmaf)
 #   REF, DIST   inputs                   (default: build/*.y4m test clips)
 #   THREADS     multi-thread count       (default: performance cores)
+#   THREAD_LIST thread counts to run     (default: "1 $THREADS"; 0 runs
+#               the extractors on the calling thread, the CLI default)
 #   RUNS        runs per config, best is reported (default: 1)
 #
 # Prints a markdown table.
@@ -71,7 +73,7 @@ fi
 
 echo "| config | threads | time (s) | fps | speedup vs CPU |"
 echo "|---|---:|---:|---:|---:|"
-for t in 1 "$THREADS"; do
+for t in ${THREAD_LIST:-1 $THREADS}; do
     cpu=$(run "$CPU_VMAF" "$t" $cpu_args)
     exact=$(run "$METAL_VMAF" "$t" $metal_args)
     fast=$(run "$METAL_VMAF" "$t" $metal_args --metal_fast)

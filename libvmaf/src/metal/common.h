@@ -36,6 +36,12 @@ struct VmafMetalState {
     bool fast_math;
     pthread_mutex_t lock; ///< guards the pipeline cache
     VmafMetalPipeline *pipelines;
+
+    // in-flight frames, see vmaf_metal_frames_commit() and vmaf_metal_sync()
+    pthread_mutex_t work_lock;
+    pthread_cond_t work_done;
+    unsigned work_pending;
+    int work_err;
 };
 
 /**
@@ -51,6 +57,20 @@ void vmaf_metal_state_free(VmafMetalState *s);
  * @return NULL if no Metal device is available.
  */
 VmafMetalState *vmaf_metal_state_default(void);
+
+/**
+ * Wait until all frames committed with vmaf_metal_frames_commit() on state
+ * `s` have completed, including their completion blocks, which write the
+ * scores.
+ *
+ * @return the first error of any completed frame, or 0.
+ */
+int vmaf_metal_sync(VmafMetalState *s);
+
+/**
+ * The default state if it has been created, else NULL.
+ */
+VmafMetalState *vmaf_metal_state_default_peek(void);
 
 /**
  * Dispatch the self-test kernel, used to verify that the embedded metallib
@@ -118,6 +138,56 @@ id<MTLComputePipelineState> vmaf_metal_pipeline(VmafMetalState *s,
  * Allocate a buffer in shared (CPU + GPU visible) storage.
  */
 id<MTLBuffer> vmaf_metal_buffer(VmafMetalState *s, size_t size);
+
+/**
+ * Number of frames an extractor context can have in flight.
+ */
+#define VMAF_METAL_FRAMES 3
+
+/**
+ * Asynchronous frames of one extractor context.
+ *
+ * extract() acquires a slot, fills the slot's input buffers, encodes and
+ * commits a command buffer, and returns without waiting. A completion block
+ * reads the slot's output buffers and writes the scores. Buffers that the CPU
+ * writes before the commit or reads after the completion are per slot; GPU
+ * intermediates can be shared, since command buffers of one queue are
+ * ordered by Metal's hazard tracking.
+ */
+typedef struct VmafMetalFrames {
+    VmafMetalState *ms;
+    unsigned next;
+    void *slot_free[VMAF_METAL_FRAMES]; ///< dispatch_semaphore_t, retained
+} VmafMetalFrames;
+
+int vmaf_metal_frames_init(VmafMetalFrames *f, VmafMetalState *ms);
+
+/**
+ * Wait until the next slot is free.
+ *
+ * @return slot index, in [0, VMAF_METAL_FRAMES).
+ */
+unsigned vmaf_metal_frames_acquire(VmafMetalFrames *f);
+
+/**
+ * Release a slot without committing, e.g. on an encoding error.
+ */
+void vmaf_metal_frames_cancel(VmafMetalFrames *f, unsigned slot);
+
+/**
+ * Commit `cb` for `slot`. When the GPU has completed it, `done` is called
+ * with 0, or -EIO if the command buffer failed, on a Metal thread. Its return
+ * value is recorded for vmaf_metal_sync(). The slot is free again after
+ * `done` returns.
+ */
+void vmaf_metal_frames_commit(VmafMetalFrames *f, unsigned slot,
+                              id<MTLCommandBuffer> cb, int (^done)(int err));
+
+/**
+ * Wait until all slots are free, and release them. Safe to call on a
+ * zero-initialized VmafMetalFrames.
+ */
+void vmaf_metal_frames_close(VmafMetalFrames *f);
 
 /**
  * Dispatch a 2D grid of w x h threads using a threadgroup size that suits

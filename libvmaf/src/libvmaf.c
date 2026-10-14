@@ -310,6 +310,19 @@ static int set_fex_metal_state(VmafFeatureExtractorContext *fex_ctx,
     return 0;
 }
 
+/**
+ * Wait for the frames that Metal feature extractors have in flight; they
+ * write their scores asynchronously, see vmaf_metal_frames_commit().
+ * Extractors use the imported state, or the default state.
+ */
+static int metal_sync(VmafContext *vmaf)
+{
+    int err = vmaf_metal_sync(vmaf->metal_state);
+    VmafMetalState *def = vmaf_metal_state_default_peek();
+    if (def && def != vmaf->metal_state) err |= vmaf_metal_sync(def);
+    return err;
+}
+
 #endif
 
 static int prepare_picture_pool(VmafContext *vmaf, unsigned pic_cnt,
@@ -384,6 +397,9 @@ int vmaf_close(VmafContext *vmaf)
     if (!vmaf) return -EINVAL;
 
     vmaf_thread_pool_wait(vmaf->thread_pool);
+#ifdef HAVE_METAL
+    metal_sync(vmaf);
+#endif
     if (vmaf->prev_ref.ref)
         vmaf_picture_unref(&vmaf->prev_ref);
     if (vmaf->prev_prev_ref.ref)
@@ -855,8 +871,14 @@ static int flush_context_threaded(VmafContext *vmaf)
 static int flush_context(VmafContext *vmaf)
 {
     int err = 0;
+#ifdef HAVE_METAL
+    // Metal frames are committed by the thread pool, if any
     if (vmaf->thread_pool)
-        err = flush_context_threaded(vmaf);
+        err |= vmaf_thread_pool_wait(vmaf->thread_pool);
+    err |= metal_sync(vmaf);
+#endif
+    if (vmaf->thread_pool)
+        err |= flush_context_threaded(vmaf);
     else {
         RegisteredFeatureExtractors rfe = vmaf->registered_feature_extractors;
         for (unsigned i = 0; i < rfe.cnt; i++) {

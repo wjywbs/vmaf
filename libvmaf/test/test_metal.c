@@ -94,6 +94,93 @@ static uint64_t rng(void)
     return rng_state = x;
 }
 
+static int read_frame(VmafContext *vmaf, unsigned w, unsigned h, unsigned index)
+{
+    VmafPicture ref, dist;
+    int err = vmaf_picture_alloc(&ref, VMAF_PIX_FMT_YUV420P, 8, w, h);
+    err |= vmaf_picture_alloc(&dist, VMAF_PIX_FMT_YUV420P, 8, w, h);
+    if (err) return err;
+    for (unsigned i = 0; i < h; i++) {
+        uint8_t *r = (uint8_t *)ref.data[0] + i * ref.stride[0];
+        uint8_t *d = (uint8_t *)dist.data[0] + i * dist.stride[0];
+        for (unsigned j = 0; j < w; j++) {
+            r[j] = (uint8_t)(64 + (i * 3 + j * 5 + index * 7) % 128);
+            d[j] = (uint8_t)(r[j] + rng() % 9 - 4);
+        }
+    }
+    return vmaf_read_pictures(vmaf, &ref, &dist, index);
+}
+
+static int use_metal_features(VmafContext *vmaf)
+{
+    int err = vmaf_use_feature(vmaf, "vif_metal", NULL);
+    err |= vmaf_use_feature(vmaf, "adm_metal", NULL);
+    err |= vmaf_use_feature(vmaf, "motion_metal", NULL);
+    return err;
+}
+
+/**
+ * Metal extractors write their scores asynchronously. All scores must be
+ * available after the flush, and closing a context with frames in flight
+ * must be safe.
+ */
+static char *test_metal_async()
+{
+    static const char *names[] = {
+        "VMAF_integer_feature_vif_scale0_score",
+        "VMAF_integer_feature_adm2_score",
+        "VMAF_integer_feature_motion_sad_score",
+    };
+    const unsigned w = 160, h = 96, n = 8;
+
+    for (unsigned n_threads = 0; n_threads <= 2; n_threads += 2) {
+        VmafContext *vmaf;
+        VmafConfiguration cfg = { .log_level = VMAF_LOG_LEVEL_NONE,
+                                  .n_threads = n_threads };
+        int err = vmaf_init(&vmaf, cfg);
+        mu_assert("problem during vmaf_init", !err);
+        VmafMetalState *s = NULL;
+        VmafMetalConfiguration metal_cfg = { 0 };
+        err = vmaf_metal_state_init(&s, metal_cfg);
+        err |= vmaf_metal_import_state(vmaf, s);
+        err |= use_metal_features(vmaf);
+        mu_assert("problem setting up Metal features", !err);
+
+        for (unsigned i = 0; i < n; i++) {
+            err = read_frame(vmaf, w, h, i);
+            mu_assert("problem during vmaf_read_pictures", !err);
+        }
+        err = vmaf_read_pictures(vmaf, NULL, NULL, 0);
+        mu_assert("problem flushing", !err);
+        for (unsigned i = 0; i < n; i++) {
+            for (unsigned k = 0; k < 3; k++) {
+                double score;
+                err = vmaf_feature_score_at_index(vmaf, names[k], &score, i);
+                mu_assert("score not available after flush", !err);
+            }
+        }
+        err = vmaf_close(vmaf);
+        mu_assert("problem during vmaf_close", !err);
+    }
+
+    // close with frames in flight, without flushing
+    for (unsigned n_threads = 0; n_threads <= 2; n_threads += 2) {
+        VmafContext *vmaf;
+        VmafConfiguration cfg = { .log_level = VMAF_LOG_LEVEL_NONE,
+                                  .n_threads = n_threads };
+        int err = vmaf_init(&vmaf, cfg);
+        err |= use_metal_features(vmaf); // default Metal state
+        mu_assert("problem setting up Metal features", !err);
+        for (unsigned i = 0; i < n; i++) {
+            err = read_frame(vmaf, 1920, 1080, i);
+            mu_assert("problem during vmaf_read_pictures", !err);
+        }
+        err = vmaf_close(vmaf);
+        mu_assert("problem during vmaf_close", !err);
+    }
+    return NULL;
+}
+
 static uint64_t to_bits(double d)
 {
     uint64_t u;
@@ -202,5 +289,6 @@ char *run_tests()
     mu_run_test(test_metal_default_state);
     mu_run_test(test_metal_import_state);
     mu_run_test(test_metal_soft_f64);
+    mu_run_test(test_metal_async);
     return NULL;
 }

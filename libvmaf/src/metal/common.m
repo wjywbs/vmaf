@@ -65,6 +65,10 @@ static int state_open(VmafMetalState *s, id<MTLDevice> device, bool fast_math)
     s->fast_math = fast_math;
     s->pipelines = NULL;
     pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->work_lock, NULL);
+    pthread_cond_init(&s->work_done, NULL);
+    s->work_pending = 0;
+    s->work_err = 0;
     return 0;
 }
 
@@ -93,6 +97,7 @@ void vmaf_metal_state_free(VmafMetalState *s)
 {
     if (!s) return;
 
+    vmaf_metal_sync(s);
     VmafMetalPipeline *p = s->pipelines;
     while (p) {
         VmafMetalPipeline *next = p->next;
@@ -105,6 +110,8 @@ void vmaf_metal_state_free(VmafMetalState *s)
     if (s->queue) CFRelease(s->queue);
     if (s->device) CFRelease(s->device);
     pthread_mutex_destroy(&s->lock);
+    pthread_mutex_destroy(&s->work_lock);
+    pthread_cond_destroy(&s->work_done);
     free(s);
 }
 
@@ -123,6 +130,99 @@ VmafMetalState *vmaf_metal_state_default(void)
 {
     pthread_once(&default_state_once, default_state_open);
     return default_state;
+}
+
+VmafMetalState *vmaf_metal_state_default_peek(void)
+{
+    return __atomic_load_n(&default_state, __ATOMIC_ACQUIRE);
+}
+
+int vmaf_metal_sync(VmafMetalState *s)
+{
+    if (!s) return 0;
+    pthread_mutex_lock(&s->work_lock);
+    while (s->work_pending)
+        pthread_cond_wait(&s->work_done, &s->work_lock);
+    const int err = s->work_err;
+    pthread_mutex_unlock(&s->work_lock);
+    return err;
+}
+
+int vmaf_metal_frames_init(VmafMetalFrames *f, VmafMetalState *ms)
+{
+    f->ms = ms;
+    f->next = 0;
+    for (unsigned i = 0; i < VMAF_METAL_FRAMES; i++) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(1);
+        if (!sem) return -ENOMEM;
+        f->slot_free[i] = (void *)CFBridgingRetain(sem);
+    }
+    return 0;
+}
+
+static inline dispatch_semaphore_t slot_sem(VmafMetalFrames *f, unsigned slot)
+{
+    return (__bridge dispatch_semaphore_t)f->slot_free[slot];
+}
+
+unsigned vmaf_metal_frames_acquire(VmafMetalFrames *f)
+{
+    const unsigned slot = f->next;
+    f->next = (f->next + 1) % VMAF_METAL_FRAMES;
+    dispatch_semaphore_wait(slot_sem(f, slot), DISPATCH_TIME_FOREVER);
+    return slot;
+}
+
+void vmaf_metal_frames_cancel(VmafMetalFrames *f, unsigned slot)
+{
+    dispatch_semaphore_signal(slot_sem(f, slot));
+}
+
+void vmaf_metal_frames_commit(VmafMetalFrames *f, unsigned slot,
+                              id<MTLCommandBuffer> cb, int (^done)(int err))
+{
+    VmafMetalState *s = f->ms;
+    dispatch_semaphore_t sem = slot_sem(f, slot);
+
+    pthread_mutex_lock(&s->work_lock);
+    s->work_pending++;
+    pthread_mutex_unlock(&s->work_lock);
+
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        // Everything the committing thread wrote before the commit (state,
+        // input buffers) is visible here, through the driver. Make that
+        // ordering explicit, also for ThreadSanitizer: the committing thread
+        // released work_lock after counting this frame.
+        pthread_mutex_lock(&s->work_lock);
+        pthread_mutex_unlock(&s->work_lock);
+
+        int err = c.status == MTLCommandBufferStatusCompleted ? 0 : -EIO;
+        if (err) {
+            vmaf_log(VMAF_LOG_LEVEL_ERROR, "Metal command buffer failed: %s\n",
+                     c.error.localizedDescription.UTF8String);
+        }
+        err = done(err);
+        dispatch_semaphore_signal(sem);
+
+        pthread_mutex_lock(&s->work_lock);
+        if (err && !s->work_err) s->work_err = err;
+        if (!--s->work_pending) pthread_cond_broadcast(&s->work_done);
+        pthread_mutex_unlock(&s->work_lock);
+    }];
+    [cb commit];
+}
+
+void vmaf_metal_frames_close(VmafMetalFrames *f)
+{
+    for (unsigned i = 0; i < VMAF_METAL_FRAMES; i++) {
+        if (!f->slot_free[i]) continue;
+        dispatch_semaphore_t sem = slot_sem(f, i);
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        // a semaphore must be back at its initial value when released
+        dispatch_semaphore_signal(sem);
+        CFRelease(f->slot_free[i]);
+        f->slot_free[i] = NULL;
+    }
 }
 
 id<MTLComputePipelineState> vmaf_metal_pipeline(VmafMetalState *s,

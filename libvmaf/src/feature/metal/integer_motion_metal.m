@@ -50,11 +50,12 @@ typedef struct MotionStateMetal {
 
     VmafDictionary *feature_name_dict;
     VmafMetalState *ms;
+    VmafMetalFrames frames;
     unsigned w, h, bpc;
 
-    // id<MTLBuffer>, retained
-    void *prev, *cur;
-    void *row_sad;
+    // id<MTLBuffer>, retained, per frame slot
+    void *prev[VMAF_METAL_FRAMES], *cur[VMAF_METAL_FRAMES];
+    void *row_sad[VMAF_METAL_FRAMES];
 } MotionStateMetal;
 
 static const VmafOption options[] = {
@@ -152,10 +153,13 @@ static inline id<MTLBuffer> B(void *buf)
 
 static void buffers_free(MotionStateMetal *s)
 {
-    void **bufs[] = { &s->prev, &s->cur, &s->row_sad };
-    for (unsigned i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
-        if (*bufs[i]) CFRelease(*bufs[i]);
-        *bufs[i] = NULL;
+    vmaf_metal_frames_close(&s->frames);
+    for (unsigned k = 0; k < VMAF_METAL_FRAMES; k++) {
+        void **bufs[] = { &s->prev[k], &s->cur[k], &s->row_sad[k] };
+        for (unsigned i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
+            if (*bufs[i]) CFRelease(*bufs[i]);
+            *bufs[i] = NULL;
+        }
     }
 }
 
@@ -171,11 +175,14 @@ static int init_fex(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     s->h = h;
     s->bpc = bpc;
 
+    if (vmaf_metal_frames_init(&s->frames, s->ms)) goto fail;
     const size_t bpp = bpc > 8 ? 2 : 1;
-    s->prev = buffer_new(s->ms, (size_t)w * h * bpp);
-    s->cur = buffer_new(s->ms, (size_t)w * h * bpp);
-    s->row_sad = buffer_new(s->ms, (size_t)h * sizeof(uint32_t));
-    if (!s->prev || !s->cur || !s->row_sad) goto fail;
+    for (unsigned k = 0; k < VMAF_METAL_FRAMES; k++) {
+        s->prev[k] = buffer_new(s->ms, (size_t)w * h * bpp);
+        s->cur[k] = buffer_new(s->ms, (size_t)w * h * bpp);
+        s->row_sad[k] = buffer_new(s->ms, (size_t)h * sizeof(uint32_t));
+        if (!s->prev[k] || !s->cur[k] || !s->row_sad[k]) goto fail;
+    }
 
     s->feature_name_dict =
         vmaf_feature_name_dict_from_provided_features(fex->provided_features,
@@ -189,13 +196,39 @@ fail:
     return -ENOMEM;
 }
 
-/** motion_score_pipeline_8/16() of integer_motion.c */
-static int motion_sad(MotionStateMetal *s, const VmafPicture *prev,
-                      const VmafPicture *cur, uint64_t *sad)
+static int write_scores(MotionStateMetal *s, double score, unsigned index,
+                        VmafFeatureCollector *feature_collector)
 {
+    int err = vmaf_feature_collector_append_with_dict(feature_collector,
+            s->feature_name_dict,
+            "VMAF_integer_feature_motion_sad_score", score, index);
+    if (err) return err;
+
+    if (s->debug) {
+        return vmaf_feature_collector_append_with_dict(feature_collector,
+                s->feature_name_dict,
+                "VMAF_integer_feature_motion_score", score, index);
+    }
+
+    return 0;
+}
+
+/**
+ * motion_score_pipeline_8/16() of integer_motion.c on the GPU, then the
+ * score of extract(), written when the frame completes.
+ */
+static int motion_sad(MotionStateMetal *s, const VmafPicture *prev,
+                      const VmafPicture *cur, unsigned index,
+                      VmafFeatureCollector *feature_collector)
+{
+    id<MTLComputePipelineState> pipeline =
+        vmaf_metal_pipeline(s->ms, "motion_metal_sad", s->bpc);
+    if (!pipeline) return -EINVAL;
+
+    const unsigned slot = vmaf_metal_frames_acquire(&s->frames);
     const size_t bpp = s->bpc > 8 ? 2 : 1;
-    vmaf_metal_copy_plane(B(s->prev).contents, s->w * bpp, prev, 0);
-    vmaf_metal_copy_plane(B(s->cur).contents, s->w * bpp, cur, 0);
+    vmaf_metal_copy_plane(B(s->prev[slot]).contents, s->w * bpp, prev, 0);
+    vmaf_metal_copy_plane(B(s->cur[slot]).contents, s->w * bpp, cur, 0);
 
     const MotionMetalParams p = {
         .w = s->w,
@@ -205,34 +238,33 @@ static int motion_sad(MotionStateMetal *s, const VmafPicture *prev,
     };
 
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline =
-            vmaf_metal_pipeline(s->ms, "motion_metal_sad", s->bpc);
-        if (!pipeline) return -EINVAL;
-
         id<MTLCommandBuffer> cb = [vmaf_metal_queue(s->ms) commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         NSUInteger tw = MIN((s->w + 31) / 32 * 32, MOTION_METAL_MAX_TG_W);
         tw = MIN(tw, pipeline.maxTotalThreadsPerThreadgroup / 32 * 32);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&p length:sizeof(p) atIndex:0];
-        [enc setBuffer:B(s->prev) offset:0 atIndex:1];
-        [enc setBuffer:B(s->cur) offset:0 atIndex:2];
-        [enc setBuffer:B(s->row_sad) offset:0 atIndex:3];
+        [enc setBuffer:B(s->prev[slot]) offset:0 atIndex:1];
+        [enc setBuffer:B(s->cur[slot]) offset:0 atIndex:2];
+        [enc setBuffer:B(s->row_sad[slot]) offset:0 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(s->h, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
         [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-        if (cb.status != MTLCommandBufferStatusCompleted) {
-            vmaf_log(VMAF_LOG_LEVEL_ERROR, "motion_metal: command buffer failed\n");
-            return -EIO;
-        }
-    }
 
-    const uint32_t *row_sad = B(s->row_sad).contents;
-    uint64_t sum = 0;
-    for (unsigned i = 0; i < s->h; i++) sum += row_sad[i];
-    *sad = sum;
+        vmaf_metal_frames_commit(&s->frames, slot, cb, ^int(int err) {
+            if (err) return err;
+            const uint32_t *row_sad = B(s->row_sad[slot]).contents;
+            uint64_t sad = 0;
+            for (unsigned i = 0; i < s->h; i++) sad += row_sad[i];
+
+            const unsigned w = s->w;
+            const unsigned h = s->h;
+            const double score =
+                MIN((double)sad / 256. / (w * h) * s->motion_fps_weight,
+                    s->motion_max_val);
+            return write_scores(s, score, index, feature_collector);
+        });
+    }
     return 0;
 }
 
@@ -248,42 +280,20 @@ static int extract_fex(VmafFeatureExtractor *fex,
     (void) ref_pic_90;
     (void) dist_pic_90;
 
-    double score = 0.;
-    int err = 0;
-
-    if (s->motion_force_zero) goto write_score;
+    if (s->motion_force_zero)
+        return write_scores(s, 0., index, feature_collector);
 
     const unsigned min_idx = s->motion_five_frame_window ? 2 : 1;
-    if (index >= min_idx) {
-        const VmafPicture *prev = s->motion_five_frame_window
-            ? &fex->prev_prev_ref
-            : &fex->prev_ref;
-        if (!prev->ref)
-            return -EINVAL;
+    if (index < min_idx)
+        return write_scores(s, 0., index, feature_collector);
 
-        const unsigned w = s->w;
-        const unsigned h = s->h;
-        uint64_t sad;
-        err = motion_sad(s, prev, ref_pic, &sad);
-        if (err) return err;
+    const VmafPicture *prev = s->motion_five_frame_window
+        ? &fex->prev_prev_ref
+        : &fex->prev_ref;
+    if (!prev->ref)
+        return -EINVAL;
 
-        score = MIN((double)sad / 256. / (w * h) * s->motion_fps_weight,
-                    s->motion_max_val);
-    }
-
-write_score:
-    err = vmaf_feature_collector_append_with_dict(feature_collector,
-            s->feature_name_dict,
-            "VMAF_integer_feature_motion_sad_score", score, index);
-    if (err) return err;
-
-    if (s->debug) {
-        return vmaf_feature_collector_append_with_dict(feature_collector,
-                s->feature_name_dict,
-                "VMAF_integer_feature_motion_score", score, index);
-    }
-
-    return 0;
+    return motion_sad(s, prev, ref_pic, index, feature_collector);
 }
 
 static int close_fex(VmafFeatureExtractor *fex)

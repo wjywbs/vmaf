@@ -42,6 +42,7 @@ typedef struct VifStateMetal {
 
     VmafDictionary *feature_name_dict;
     VmafMetalState *ms;
+    VmafMetalFrames frames;
     unsigned w, h, bpc;
     unsigned tg_cnt[4]; // stat threadgroups per scale
     unsigned partial_offset[4];
@@ -50,10 +51,11 @@ typedef struct VifStateMetal {
     uint16_t log2_table[65537];
 
     // id<MTLBuffer>, retained
-    void *src_ref[4], *src_dis[4]; // scale 0: input bpc, scales > 0: uint16
+    void *in_ref[VMAF_METAL_FRAMES], *in_dis[VMAF_METAL_FRAMES]; // scale 0, input bpc
+    void *src_ref[4], *src_dis[4]; // scales > 0: uint16, [0] unused
     void *mu1, *mu2, *xx, *yy, *xy;
     void *log2;
-    void *partial;
+    void *partial[VMAF_METAL_FRAMES];
 } VifStateMetal;
 
 static const VmafOption options[] = {
@@ -101,11 +103,16 @@ static inline id<MTLBuffer> B(void *buf)
 
 static void buffers_free(VifStateMetal *s)
 {
+    vmaf_metal_frames_close(&s->frames);
     void **bufs[] = {
-        &s->src_ref[0], &s->src_ref[1], &s->src_ref[2], &s->src_ref[3],
-        &s->src_dis[0], &s->src_dis[1], &s->src_dis[2], &s->src_dis[3],
-        &s->mu1, &s->mu2, &s->xx, &s->yy, &s->xy, &s->log2, &s->partial,
+        &s->in_ref[0], &s->in_ref[1], &s->in_ref[2],
+        &s->in_dis[0], &s->in_dis[1], &s->in_dis[2],
+        &s->partial[0], &s->partial[1], &s->partial[2],
+        &s->src_ref[1], &s->src_ref[2], &s->src_ref[3],
+        &s->src_dis[1], &s->src_dis[2], &s->src_dis[3],
+        &s->mu1, &s->mu2, &s->xx, &s->yy, &s->xy, &s->log2,
     };
+    _Static_assert(VMAF_METAL_FRAMES == 3, "update bufs[]");
     for (unsigned i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
         if (*bufs[i]) CFRelease(*bufs[i]);
         *bufs[i] = NULL;
@@ -139,8 +146,7 @@ static int init_fex(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
 
     const size_t px = (size_t)w * h;
     const size_t bpp = bpc > 8 ? 2 : 1;
-    s->src_ref[0] = buffer_new(s->ms, px * bpp);
-    s->src_dis[0] = buffer_new(s->ms, px * bpp);
+    if (vmaf_metal_frames_init(&s->frames, s->ms)) goto fail;
     for (unsigned scale = 1; scale < 4; scale++) {
         const size_t spx = (size_t)(w >> scale) * (h >> scale);
         s->src_ref[scale] = buffer_new(s->ms, spx * sizeof(uint16_t));
@@ -161,11 +167,14 @@ static int init_fex(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
         s->partial_offset[scale] = s->partial_cnt;
         s->partial_cnt += s->tg_cnt[scale];
     }
-    s->partial = buffer_new(s->ms, s->partial_cnt * VIF_METAL_N_ACCUM *
-                                   sizeof(int64_t));
-
-    bool ok = s->src_ref[0] && s->src_dis[0] && s->mu1 && s->mu2 && s->xx &&
-              s->yy && s->xy && s->log2 && s->partial;
+    bool ok = s->mu1 && s->mu2 && s->xx && s->yy && s->xy && s->log2;
+    for (unsigned k = 0; k < VMAF_METAL_FRAMES; k++) {
+        s->in_ref[k] = buffer_new(s->ms, px * bpp);
+        s->in_dis[k] = buffer_new(s->ms, px * bpp);
+        s->partial[k] = buffer_new(s->ms, s->partial_cnt * VIF_METAL_N_ACCUM *
+                                          sizeof(int64_t));
+        ok = ok && s->in_ref[k] && s->in_dis[k] && s->partial[k];
+    }
     for (unsigned scale = 1; scale < 4; scale++)
         ok = ok && s->src_ref[scale] && s->src_dis[scale];
     if (!ok) goto fail;
@@ -191,102 +200,13 @@ static uint64_t double_bits(double d)
     return u;
 }
 
-static int extract_fex(VmafFeatureExtractor *fex,
-                   VmafPicture *ref_pic, VmafPicture *ref_pic_90,
-                   VmafPicture *dist_pic, VmafPicture *dist_pic_90,
-                   unsigned index, VmafFeatureCollector *feature_collector)
+/** Scores from the partial sums of frame slot `slot`. */
+static int compute_scores(const VifStateMetal *s, unsigned slot,
+                          unsigned index, VmafFeatureCollector *feature_collector)
 {
-    VifStateMetal *s = fex->priv;
-    (void)ref_pic_90;
-    (void)dist_pic_90;
-
-    const size_t bpp = s->bpc > 8 ? 2 : 1;
-    vmaf_metal_copy_plane(B(s->src_ref[0]).contents, s->w * bpp, ref_pic, 0);
-    vmaf_metal_copy_plane(B(s->src_dis[0]).contents, s->w * bpp, dist_pic, 0);
-
     const unsigned scale_start = s->vif_skip_scale0 ? 1 : 0;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cb = [vmaf_metal_queue(s->ms) commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-
-        for (unsigned scale = 0; scale < 4; scale++) {
-            const unsigned variant = scale | (s->bpc << 8);
-            VifMetalParams p = {
-                .w = s->w >> scale,
-                .h = s->h >> scale,
-                .src_stride = s->w >> scale,
-                .bpc = s->bpc,
-                .scale = scale,
-                .partial_offset = s->partial_offset[scale],
-                .tg_cols = ((s->w >> scale) + VIF_METAL_TG_W - 1) / VIF_METAL_TG_W,
-                .noclamp_end = scale == 0 ? s->noclamp_end : 0,
-                .gain_limit_f = s->vif_enhn_gain_limit,
-                .gain_limit = double_bits(s->vif_enhn_gain_limit),
-            };
-
-            if (scale >= scale_start) {
-                id<MTLComputePipelineState> vertical =
-                    vmaf_metal_pipeline(s->ms, "vif_metal_vertical", variant);
-                id<MTLComputePipelineState> stat =
-                    vmaf_metal_pipeline(s->ms, "vif_metal_stat", variant);
-                if (!vertical || !stat) {
-                    [enc endEncoding];
-                    return -EINVAL;
-                }
-
-                [enc setBytes:&p length:sizeof(p) atIndex:0];
-                [enc setBuffer:B(s->src_ref[scale]) offset:0 atIndex:1];
-                [enc setBuffer:B(s->src_dis[scale]) offset:0 atIndex:2];
-                [enc setBuffer:B(s->mu1) offset:0 atIndex:3];
-                [enc setBuffer:B(s->mu2) offset:0 atIndex:4];
-                [enc setBuffer:B(s->xx) offset:0 atIndex:5];
-                [enc setBuffer:B(s->yy) offset:0 atIndex:6];
-                [enc setBuffer:B(s->xy) offset:0 atIndex:7];
-                vmaf_metal_dispatch_2d(enc, vertical, p.w, p.h);
-
-                [enc setComputePipelineState:stat];
-                [enc setBuffer:B(s->mu1) offset:0 atIndex:1];
-                [enc setBuffer:B(s->mu2) offset:0 atIndex:2];
-                [enc setBuffer:B(s->xx) offset:0 atIndex:3];
-                [enc setBuffer:B(s->yy) offset:0 atIndex:4];
-                [enc setBuffer:B(s->xy) offset:0 atIndex:5];
-                [enc setBuffer:B(s->log2) offset:0 atIndex:6];
-                [enc setBuffer:B(s->partial) offset:0 atIndex:7];
-                [enc dispatchThreadgroups:MTLSizeMake(p.tg_cols,
-                        s->tg_cnt[scale] / p.tg_cols, 1)
-                    threadsPerThreadgroup:MTLSizeMake(VIF_METAL_TG_W,
-                        VIF_METAL_TG_H, 1)];
-            }
-
-            if (scale < 3) {
-                id<MTLComputePipelineState> subsample =
-                    vmaf_metal_pipeline(s->ms, "vif_metal_subsample", variant);
-                if (!subsample) {
-                    [enc endEncoding];
-                    return -EINVAL;
-                }
-                p.dst_stride = s->w >> (scale + 1);
-                [enc setBytes:&p length:sizeof(p) atIndex:0];
-                [enc setBuffer:B(s->src_ref[scale]) offset:0 atIndex:1];
-                [enc setBuffer:B(s->src_dis[scale]) offset:0 atIndex:2];
-                [enc setBuffer:B(s->src_ref[scale + 1]) offset:0 atIndex:3];
-                [enc setBuffer:B(s->src_dis[scale + 1]) offset:0 atIndex:4];
-                vmaf_metal_dispatch_2d(enc, subsample, p.w / 2, p.h / 2);
-            }
-        }
-
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-        if (cb.status != MTLCommandBufferStatusCompleted) {
-            vmaf_log(VMAF_LOG_LEVEL_ERROR, "vif_metal: command buffer failed\n");
-            return -EIO;
-        }
-    }
-
     VifScore vif_score = { 0 };
-    const int64_t *partial = B(s->partial).contents;
+    const int64_t *partial = B(s->partial[slot]).contents;
     for (unsigned scale = scale_start; scale < 4; scale++) {
         VifResiduals r = { 0 };
         const int64_t *p = partial + s->partial_offset[scale] * VIF_METAL_N_ACCUM;
@@ -302,6 +222,100 @@ static int extract_fex(VmafFeatureExtractor *fex,
 
     return vif_write_scores(feature_collector, s->feature_name_dict, index,
                             vif_score, s->vif_skip_scale0, s->debug);
+}
+
+static int extract_fex(VmafFeatureExtractor *fex,
+                   VmafPicture *ref_pic, VmafPicture *ref_pic_90,
+                   VmafPicture *dist_pic, VmafPicture *dist_pic_90,
+                   unsigned index, VmafFeatureCollector *feature_collector)
+{
+    VifStateMetal *s = fex->priv;
+    (void)ref_pic_90;
+    (void)dist_pic_90;
+
+    const unsigned scale_start = s->vif_skip_scale0 ? 1 : 0;
+
+    id<MTLComputePipelineState> vertical[4], stat[4], subsample[3];
+    for (unsigned scale = 0; scale < 4; scale++) {
+        const unsigned variant = scale | (s->bpc << 8);
+        vertical[scale] = vmaf_metal_pipeline(s->ms, "vif_metal_vertical", variant);
+        stat[scale] = vmaf_metal_pipeline(s->ms, "vif_metal_stat", variant);
+        if (!vertical[scale] || !stat[scale]) return -EINVAL;
+        if (scale < 3) {
+            subsample[scale] =
+                vmaf_metal_pipeline(s->ms, "vif_metal_subsample", variant);
+            if (!subsample[scale]) return -EINVAL;
+        }
+    }
+
+    const unsigned slot = vmaf_metal_frames_acquire(&s->frames);
+    const size_t bpp = s->bpc > 8 ? 2 : 1;
+    vmaf_metal_copy_plane(B(s->in_ref[slot]).contents, s->w * bpp, ref_pic, 0);
+    vmaf_metal_copy_plane(B(s->in_dis[slot]).contents, s->w * bpp, dist_pic, 0);
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [vmaf_metal_queue(s->ms) commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        for (unsigned scale = 0; scale < 4; scale++) {
+            VifMetalParams p = {
+                .w = s->w >> scale,
+                .h = s->h >> scale,
+                .src_stride = s->w >> scale,
+                .bpc = s->bpc,
+                .scale = scale,
+                .partial_offset = s->partial_offset[scale],
+                .tg_cols = ((s->w >> scale) + VIF_METAL_TG_W - 1) / VIF_METAL_TG_W,
+                .noclamp_end = scale == 0 ? s->noclamp_end : 0,
+                .gain_limit_f = s->vif_enhn_gain_limit,
+                .gain_limit = double_bits(s->vif_enhn_gain_limit),
+            };
+            id<MTLBuffer> src_ref = B(scale ? s->src_ref[scale] : s->in_ref[slot]);
+            id<MTLBuffer> src_dis = B(scale ? s->src_dis[scale] : s->in_dis[slot]);
+
+            if (scale >= scale_start) {
+                [enc setBytes:&p length:sizeof(p) atIndex:0];
+                [enc setBuffer:src_ref offset:0 atIndex:1];
+                [enc setBuffer:src_dis offset:0 atIndex:2];
+                [enc setBuffer:B(s->mu1) offset:0 atIndex:3];
+                [enc setBuffer:B(s->mu2) offset:0 atIndex:4];
+                [enc setBuffer:B(s->xx) offset:0 atIndex:5];
+                [enc setBuffer:B(s->yy) offset:0 atIndex:6];
+                [enc setBuffer:B(s->xy) offset:0 atIndex:7];
+                vmaf_metal_dispatch_2d(enc, vertical[scale], p.w, p.h);
+
+                [enc setComputePipelineState:stat[scale]];
+                [enc setBuffer:B(s->mu1) offset:0 atIndex:1];
+                [enc setBuffer:B(s->mu2) offset:0 atIndex:2];
+                [enc setBuffer:B(s->xx) offset:0 atIndex:3];
+                [enc setBuffer:B(s->yy) offset:0 atIndex:4];
+                [enc setBuffer:B(s->xy) offset:0 atIndex:5];
+                [enc setBuffer:B(s->log2) offset:0 atIndex:6];
+                [enc setBuffer:B(s->partial[slot]) offset:0 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(p.tg_cols,
+                        s->tg_cnt[scale] / p.tg_cols, 1)
+                    threadsPerThreadgroup:MTLSizeMake(VIF_METAL_TG_W,
+                        VIF_METAL_TG_H, 1)];
+            }
+
+            if (scale < 3) {
+                p.dst_stride = s->w >> (scale + 1);
+                [enc setBytes:&p length:sizeof(p) atIndex:0];
+                [enc setBuffer:src_ref offset:0 atIndex:1];
+                [enc setBuffer:src_dis offset:0 atIndex:2];
+                [enc setBuffer:B(s->src_ref[scale + 1]) offset:0 atIndex:3];
+                [enc setBuffer:B(s->src_dis[scale + 1]) offset:0 atIndex:4];
+                vmaf_metal_dispatch_2d(enc, subsample[scale], p.w / 2, p.h / 2);
+            }
+        }
+
+        [enc endEncoding];
+        vmaf_metal_frames_commit(&s->frames, slot, cb, ^int(int err) {
+            if (err) return err;
+            return compute_scores(s, slot, index, feature_collector);
+        });
+    }
+    return 0;
 }
 
 static int close_fex(VmafFeatureExtractor *fex)
