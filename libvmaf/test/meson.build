@@ -349,6 +349,14 @@ if is_metal_enabled
     )
     test('test_metal_cambi', test_metal_cambi, timeout : 120)
 
+    test_metal_speed_chroma = executable('test_metal_speed_chroma',
+        ['test.c', 'test_metal_speed_chroma.c'],
+        include_directories : [libvmaf_inc, test_inc, include_directories('../src/')],
+        link_with : get_option('default_library') == 'both' ? libvmaf.get_static_lib() : libvmaf,
+        dependencies : [thread_lib, stdatomic_dependency, math_lib],
+    )
+    test('test_metal_speed_chroma', test_metal_speed_chroma, timeout : 120)
+
     # Bit-exactness check of Metal vs CPU on real video, see doc/metal/.
     vmaf_metal_compare = executable('vmaf_metal_compare',
         ['metal/vmaf_metal_compare.c'],

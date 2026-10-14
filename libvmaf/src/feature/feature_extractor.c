@@ -60,6 +60,7 @@ extern VmafFeatureExtractor vmaf_fex_integer_vif_metal;
 extern VmafFeatureExtractor vmaf_fex_integer_adm_metal;
 extern VmafFeatureExtractor vmaf_fex_integer_motion_metal;
 extern VmafFeatureExtractor vmaf_fex_cambi_metal;
+extern VmafFeatureExtractor vmaf_fex_speed_chroma_metal;
 #endif
 extern VmafFeatureExtractor vmaf_fex_null;
 
@@ -93,6 +94,7 @@ static VmafFeatureExtractor *feature_extractor_list[] = {
     &vmaf_fex_integer_adm_metal,
     &vmaf_fex_integer_motion_metal,
     &vmaf_fex_cambi_metal,
+    &vmaf_fex_speed_chroma_metal,
 #endif
     &vmaf_fex_null,
     NULL

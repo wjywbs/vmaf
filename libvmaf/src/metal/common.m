@@ -152,6 +152,10 @@ int vmaf_metal_frames_init(VmafMetalFrames *f, VmafMetalState *ms)
 {
     f->ms = ms;
     f->next = 0;
+    dispatch_queue_t queue =
+        dispatch_queue_create("org.vmaf.metal.frames", DISPATCH_QUEUE_SERIAL);
+    if (!queue) return -ENOMEM;
+    f->queue = (void *)CFBridgingRetain(queue);
     for (unsigned i = 0; i < VMAF_METAL_FRAMES; i++) {
         dispatch_semaphore_t sem = dispatch_semaphore_create(1);
         if (!sem) return -ENOMEM;
@@ -183,12 +187,16 @@ void vmaf_metal_frames_commit(VmafMetalFrames *f, unsigned slot,
 {
     VmafMetalState *s = f->ms;
     dispatch_semaphore_t sem = slot_sem(f, slot);
+    dispatch_queue_t queue = (__bridge dispatch_queue_t)f->queue;
 
     pthread_mutex_lock(&s->work_lock);
     s->work_pending++;
     pthread_mutex_unlock(&s->work_lock);
 
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+    // Metal runs the completion handlers of a queue one at a time, so `done`
+    // runs on the context's own serial queue: the contexts of a thread pool
+    // compute their scores in parallel, each in frame order.
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { dispatch_async(queue, ^{
         // Everything the committing thread wrote before the commit (state,
         // input buffers) is visible here, through the driver. Make that
         // ordering explicit, also for ThreadSanitizer: the committing thread
@@ -208,7 +216,7 @@ void vmaf_metal_frames_commit(VmafMetalFrames *f, unsigned slot,
         if (err && !s->work_err) s->work_err = err;
         if (!--s->work_pending) pthread_cond_broadcast(&s->work_done);
         pthread_mutex_unlock(&s->work_lock);
-    }];
+    }); }];
     [cb commit];
 }
 
@@ -223,6 +231,9 @@ void vmaf_metal_frames_close(VmafMetalFrames *f)
         CFRelease(f->slot_free[i]);
         f->slot_free[i] = NULL;
     }
+    // pending blocks retain the queue
+    if (f->queue) CFRelease(f->queue);
+    f->queue = NULL;
 }
 
 id<MTLComputePipelineState> vmaf_metal_pipeline(VmafMetalState *s,

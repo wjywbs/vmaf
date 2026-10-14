@@ -136,6 +136,8 @@ Why exact needs work: Metal has no fp64, but integer VIF computes a per-pixel `d
 
 ### Step 6: speed_chroma (`speed_chroma_metal`) → `doc/metal/6-speed-chroma.md`
 - The other CPU feature of the vmaf_v1.0.16 models. Follow-up to step 5, benchmarked on the same models.
+- The GPU converts, prescales (nearest, bilinear) and filters the full-resolution planes. The host keeps the double-precision covariance and eigenvalue solve on the 1/256 output, with the CPU's code. Bicubic and lanczos4 prescales delegate to the CPU.
+- Completion handlers move to a serial dispatch queue per context, so the host work of the contexts runs in parallel.
 
 ### Step 7: float_ssim / float_ms_ssim → `doc/metal/7-ssim.md`
 - Gaussian filtering and SSIM maps in float. Exact mode reproduces the CPU's float evaluation order; fast mode allows FMA and reordering.

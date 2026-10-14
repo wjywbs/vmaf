@@ -157,6 +157,7 @@ id<MTLBuffer> vmaf_metal_buffer(VmafMetalState *s, size_t size);
 typedef struct VmafMetalFrames {
     VmafMetalState *ms;
     unsigned next;
+    void *queue; ///< dispatch_queue_t, retained: runs the `done` blocks
     void *slot_free[VMAF_METAL_FRAMES]; ///< dispatch_semaphore_t, retained
 } VmafMetalFrames;
 
@@ -176,7 +177,8 @@ void vmaf_metal_frames_cancel(VmafMetalFrames *f, unsigned slot);
 
 /**
  * Commit `cb` for `slot`. When the GPU has completed it, `done` is called
- * with 0, or -EIO if the command buffer failed, on a Metal thread. Its return
+ * with 0, or -EIO if the command buffer failed, on a serial dispatch queue of
+ * `f`: in commit order, in parallel with other VmafMetalFrames. Its return
  * value is recorded for vmaf_metal_sync(). The slot is free again after
  * `done` returns.
  */
