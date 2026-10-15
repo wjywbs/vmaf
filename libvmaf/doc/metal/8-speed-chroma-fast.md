@@ -193,6 +193,103 @@ varies at this low load, so these are approximate:
 | `est` | 0.03-0.08 s |
 | total | ~0.13 s |
 
+## Power
+
+Energy of a full run of the `vmaf` CLI on the 375-frame clip: CPU,
+Metal exact and Metal fast. Measured on an Apple M3 Max with macOS 26,
+on AC power with the display on.
+
+### Method
+
+The IOReport "Energy Model" counters are the same ones that
+`powermetrics` reads, and reading them needs no root. A small tool
+samples them, runs the command, samples again, and prints the energy
+between the samples:
+* **CPU:** `CPU Energy`, all CPU clusters
+* **GPU:** `GPU Energy`
+* **DRAM:** `DRAM0`
+
+Total is CPU + GPU + DRAM. The display and the rest of the SoC are not
+included.
+
+The counters cover the whole machine, not only the process. Idle, with
+the same background load, drew 1.16 W before the 3d0h runs (0.59 W CPU,
+0.16 W GPU, 0.41 W DRAM) and 0.50 W before the vmaf_v0.6.1 runs (0.23 W
+CPU, 0.03 W GPU, 0.24 W DRAM). That is 0.2-0.7 J over the Metal runs
+below, and these numbers include it. Each configuration ran 3 times, and the table
+shows the run with the median total. The input was in the page cache.
+
+Energy is the energy of the whole run, in joules. Power is that energy
+divided by the wall time, in watts. Energy per frame is total energy
+divided by 375.
+
+### vmaf_v0.6.1 (the default model)
+
+`--model version=vmaf_v0.6.1 [--metal_fast]`: integer VIF, ADM and motion,
+all on Metal since step 3. speed_chroma is not part of this model; the
+table shows the modes on the default model for comparison.
+
+| mode | threads | time (s) | CPU (J) | GPU (J) | DRAM (J) | total (J) | mJ / frame | CPU (W) | GPU (W) | total (W) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CPU | 0 | 12.35 | 71.80 | 0.24 | 10.78 | 82.82 | 220.8 | 5.8 | 0.0 | 6.7 |
+| Metal exact | 0 | 0.63 | 1.15 | 22.29 | 2.72 | 26.16 | 69.8 | 1.8 | 35.5 | 41.7 |
+| Metal fast | 0 | 0.42 | 1.89 | 15.21 | 2.74 | 19.84 | 52.9 | 4.5 | 36.4 | 47.5 |
+| CPU | 10 | 1.39 | 68.99 | 0.02 | 4.55 | 73.56 | 196.2 | 49.7 | 0.0 | 53.0 |
+| Metal exact | 10 | 0.64 | 2.38 | 23.19 | 3.39 | 28.97 | 77.2 | 3.7 | 36.1 | 45.1 |
+| Metal fast | 10 | 0.44 | 2.16 | 15.31 | 3.08 | 20.56 | 54.8 | 4.9 | 35.0 | 47.0 |
+
+* **Metal against the CPU.** Metal exact uses 32 % of the CPU build's
+  energy at 0 threads (26.2 J against 82.8 J) and 39 % at 10 threads
+  (29.0 J against 73.6 J). The CPU spends most of its 12.35 s at 0 threads
+  in VIF.
+* **Fast against exact.** Fast mode uses 24-29 % less energy (19.8 J
+  against 26.2 J, 20.6 J against 29.0 J), and is also 1.5x faster. Unlike
+  the 3d0h model, the saving is GPU energy (15.2 J against 22.3 J): exact
+  mode computes VIF's per pixel statistic with software doubles
+  (`soft_f64.h`), fast mode in float.
+* **Power.** The GPU draws about 35 W in both modes, against 20-25 W with
+  the 3d0h model below.
+
+### vmaf_v1.0.16_3d0h
+
+`--model version=vmaf_v1.0.16_3d0h [--metal_fast]`. Fast mode also
+changes the other features of the model (VIF, ADM), so this compares the
+modes as a whole, not only speed_chroma.
+
+| mode | threads | time (s) | CPU (J) | GPU (J) | DRAM (J) | total (J) | mJ / frame | CPU (W) | GPU (W) | total (W) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CPU | 0 | 5.49 | 31.52 | 0.19 | 6.44 | 38.15 | 101.7 | 5.7 | 0.0 | 6.9 |
+| Metal exact | 0 | 0.53 | 4.23 | 10.82 | 1.72 | 16.77 | 44.7 | 8.0 | 20.5 | 31.8 |
+| Metal fast | 0 | 0.50 | 2.10 | 10.39 | 1.69 | 14.18 | 37.8 | 4.2 | 20.7 | 28.3 |
+| CPU | 10 | 0.69 | 30.31 | 0.01 | 4.33 | 34.65 | 92.4 | 43.9 | 0.0 | 50.1 |
+| Metal exact | 10 | 0.43 | 4.64 | 10.66 | 2.08 | 17.38 | 46.3 | 10.9 | 25.0 | 40.7 |
+| Metal fast | 10 | 0.45 | 2.47 | 10.17 | 1.99 | 14.63 | 39.0 | 5.5 | 22.5 | 32.4 |
+
+* **Metal against the CPU.** Metal exact uses 44-50 % of the CPU build's
+  energy (16.8 J against 38.1 J at 0 threads, 17.4 J against 34.7 J at
+  10 threads). The GPU draws 20-25 W while it runs, so the power is much
+  higher than the single-threaded CPU run (31.8 W against 6.9 W). The run
+  is 10x shorter.
+* **Fast against exact.** Fast mode uses 15-16 % less energy (14.2 J
+  against 16.8 J, 14.6 J against 17.4 J). Most of it is CPU energy
+  (-2.1 J), mainly speed_chroma's host part, which is gone. This holds at
+  10 threads too, where fast mode is 0.03 s slower (see [Speed](#speed)):
+  it draws 32.4 W against 40.7 W.
+* **GPU energy** is about the same in both modes (10.2-10.8 J). The GPU
+  work of the model is dominated by VIF, ADM and CAMBI. The extra GPU work
+  of speed_chroma's fast mode (about 0.5 J for speed_chroma alone) is
+  offset by the cheaper float paths of VIF and ADM.
+
+### Caveats
+
+* The counters are system-wide. Background activity (the editor, the
+  terminal) adds noise of a few tenths of a joule per run. The CPU run of
+  the model is long enough to collect about 6 J of idle energy.
+* DRAM energy includes the idle refresh of the total GB of memory.
+* Power is averaged over the whole run, including the start-up (reading
+  the model, creating the Metal pipelines), which is a larger share of
+  the short Metal runs.
+
 ## Not done
 
 * **Choosing the path by load.** Fast mode always runs these steps on the
