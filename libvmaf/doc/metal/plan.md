@@ -141,6 +141,7 @@ Why exact needs work: Metal has no fp64, but integer VIF computes a per-pixel `d
 
 ### Step 7: float_ssim / float_ms_ssim → `doc/metal/7-ssim.md`
 - Gaussian filtering and SSIM maps in float. Exact mode reproduces the CPU's float evaluation order; fast mode allows FMA and reordering.
+- The CPU adds the filter products in double: exact mode uses a float-float sum with an error bound, and falls back to `soft_f64.h` when the bound cannot decide the rounding. l and c are double quotients (`soft_f64.h`). The host adds up the per pixel l, c and s in the CPU's order.
 
 PSNR, ciede, and the other speed features are cheap or niche and are left out of scope (noted in the step 7 doc).
 

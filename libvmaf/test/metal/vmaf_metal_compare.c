@@ -204,6 +204,21 @@ int main(int argc, char **argv)
                 names[n_names++] = fex->provided_features[j];
         }
     }
+    // optional outputs that are not in provided_features
+    static const char *extra_names[] = {
+        "float_ssim_l", "float_ssim_c", "float_ssim_s",
+        "float_ms_ssim_l_scale0", "float_ms_ssim_l_scale1",
+        "float_ms_ssim_l_scale2", "float_ms_ssim_l_scale3",
+        "float_ms_ssim_l_scale4", "float_ms_ssim_c_scale0",
+        "float_ms_ssim_c_scale1", "float_ms_ssim_c_scale2",
+        "float_ms_ssim_c_scale3", "float_ms_ssim_c_scale4",
+        "float_ms_ssim_s_scale0", "float_ms_ssim_s_scale1",
+        "float_ms_ssim_s_scale2", "float_ms_ssim_s_scale3",
+        "float_ms_ssim_s_scale4", NULL,
+    };
+    for (unsigned i = 0; extra_names[i]; i++) {
+        if (n_names < MAX_NAMES) names[n_names++] = extra_names[i];
+    }
 
     for (unsigned i = 0; i < n_features; i++) {
         // name[:key=value]...
@@ -235,7 +250,11 @@ int main(int argc, char **argv)
                     char *fn = vmaf_feature_name_from_options(
                         fex->provided_features[j], fex->options,
                         fex_ctx->fex->priv);
-                    if (fn && n_names < MAX_NAMES) names[n_names++] = fn;
+                    bool dup = false;
+                    for (unsigned n = 0; fn && n < n_names; n++)
+                        dup |= !strcmp(names[n], fn);
+                    if (dup) free(fn);
+                    else if (fn && n_names < MAX_NAMES) names[n_names++] = fn;
                 }
             }
             if (fex_ctx) vmaf_feature_extractor_context_destroy(fex_ctx);
