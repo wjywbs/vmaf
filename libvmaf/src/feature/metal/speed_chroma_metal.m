@@ -25,8 +25,10 @@
  * speed_extract_score() on the small planes, with the CPU code: the second
  * Gaussian filter, the local mean subtraction, and est_params() (the
  * covariance matrix, its eigenvalues and the linear system of each plane).
- * Every step is the CPU's, so the scores are bit-identical; kFast is
- * ignored.
+ * Every step is the CPU's, so the scores are bit-identical.
+ *
+ * Fast mode runs these steps on the GPU too, in float (speed_chroma.metal,
+ * encode_est()). The host only runs get_speed_score().
  */
 
 #import <Metal/Metal.h>
@@ -1033,6 +1035,13 @@ typedef struct SpeedChromaStateMetal {
     SpeedMetalParams scale_params;
     void *scaled, *scale_xi, *scale_xf, *scale_yi, *scale_yf;
     SpeedSlot slot[VMAF_METAL_FRAMES];
+    // fast mode: est_params() on the GPU. Shared: the planes minus their
+    // local means, the covariance matrices; per slot: S, E and the
+    // singular flag of the 4 planes.
+    bool fast;
+    SpeedMetalEstParams est_params;
+    void *filter_buf, *local, *means, *cov;
+    void *est_out[VMAF_METAL_FRAMES];
 } SpeedChromaStateMetal;
 
 static const VmafOption options[] = {
@@ -1212,8 +1221,13 @@ static void buffers_free(SpeedChromaStateMetal *s)
     for (unsigned k = 0; k < VMAF_METAL_FRAMES; k++) {
         release(&s->in[k]);
         release(&s->out[k]);
+        release(&s->est_out[k]);
         slot_free(&s->slot[k]);
     }
+    release(&s->filter_buf);
+    release(&s->local);
+    release(&s->means);
+    release(&s->cov);
     release(&s->filter_aa);
     release(&s->scaled);
     release(&s->scale_xi);
@@ -1404,8 +1418,34 @@ static int init_fex(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     s->filter_aa = buffer_new(s->ms, fwidth_aa * sizeof(float));
     if (!s->filter_aa) goto fail;
     memcpy(B(s->filter_aa).contents, filter_aa, fwidth_aa * sizeof(float));
+    s->fast = s->ms->fast_math;
+    const size_t n_out = (size_t)s->params.out_w * s->params.out_h;
+    if (s->fast) {
+        s->est_params = (SpeedMetalEstParams) {
+            .w = s->params.out_w, .h = s->params.out_h,
+            .fwidth = s->filter_width,
+            .sub_w = dim.submatrix_width, .sub_h = dim.submatrix_height,
+            .nbh = dim.num_blocks_horizontal, .nb = dim.num_blocks,
+            .sigma_nn = s->speed_options.speed_sigma_nn,
+            .log2_2pie = log2(2 * M_PI * M_E),
+        };
+        s->filter_buf = buffer_new(s->ms, s->filter_width * sizeof(float));
+        s->local = buffer_new(s->ms, SPEED_METAL_PLANES * n_out * sizeof(float));
+        s->cov = buffer_new(s->ms, SPEED_METAL_PLANES * SPEED_METAL_E *
+                            SPEED_METAL_E * sizeof(float));
+        s->means = buffer_new(s->ms, SPEED_METAL_PLANES * SPEED_METAL_E *
+                              sizeof(float));
+        if (!s->filter_buf || !s->local || !s->means || !s->cov) goto fail;
+        memcpy(B(s->filter_buf).contents, s->filter,
+               s->filter_width * sizeof(float));
+    }
     const size_t bpp = bpc > 8 ? 2 : 1;
     for (unsigned k = 0; k < VMAF_METAL_FRAMES; k++) {
+        if (s->fast) {
+            s->est_out[k] = buffer_new(s->ms, SPEED_METAL_PLANES *
+                    (2 * dim.num_blocks + 1) * sizeof(float));
+            if (!s->est_out[k]) goto fail;
+        }
         s->in[k] = buffer_new(s->ms, (size_t)SPEED_METAL_PLANES * w * h * bpp);
         if (!s->in[k]) goto fail;
         s->out[k] = buffer_new(s->ms, (size_t)SPEED_METAL_PLANES *
@@ -1449,24 +1489,48 @@ static int est_plane(SpeedChromaStateMetal *s, SpeedSlot *k, const float *d,
                       results);
 }
 
+/**
+ * Fast mode: the results of est_params() of `plane`, from the GPU
+ * (speed_chroma_metal_est).
+ */
+static int est_plane_fast(SpeedChromaStateMetal *s, unsigned slot,
+                          unsigned plane, SpeedResultBuffers *results)
+{
+    const int nb = s->est_params.nb;
+    float *o = (float *)B(s->est_out[slot]).contents + plane * (2 * nb + 1);
+    results->variances = o;
+    results->entropies = o + nb;
+    if (o[2 * nb] != 0.0f) {
+        vmaf_log(VMAF_LOG_LEVEL_WARNING,
+                 "est_params: covariance matrix is singular\n");
+        return -EINVAL;
+    }
+    return 0;
+}
+
 /** speed_extract_score() of one channel: planes `ref` and `ref` + 2. */
 static int channel_score(SpeedChromaStateMetal *s, unsigned slot,
                          unsigned ref, float *score)
 {
     SpeedSlot *k = &s->slot[slot];
-    const float *out = B(s->out[slot]).contents;
-    const size_t n = (size_t)s->params.out_w * s->params.out_h;
-
-    int err_ref = est_plane(s, k, out + ref * n, k->frame[0],
-                            &k->st.ref_results);
-    int err_dis = est_plane(s, k, out + (ref + 2) * n, k->frame[1],
-                            &k->st.dis_results);
+    SpeedResultBuffers ref_results = k->st.ref_results;
+    SpeedResultBuffers dis_results = k->st.dis_results;
+    int err_ref, err_dis;
+    if (s->fast) {
+        err_ref = est_plane_fast(s, slot, ref, &ref_results);
+        err_dis = est_plane_fast(s, slot, ref + 2, &dis_results);
+    } else {
+        const float *out = B(s->out[slot]).contents;
+        const size_t n = (size_t)s->params.out_w * s->params.out_h;
+        err_ref = est_plane(s, k, out + ref * n, k->frame[0], &ref_results);
+        err_dis = est_plane(s, k, out + (ref + 2) * n, k->frame[1],
+                            &dis_results);
+    }
 
     if ((err_ref && !err_dis) || (!err_ref && err_dis)) {
         *score = 0.0f;
     } else {
-        *score = get_speed_score(k->st.dimensions, k->st.ref_results,
-                                 k->st.dis_results,
+        *score = get_speed_score(k->st.dimensions, ref_results, dis_results,
                                  s->speed_options.speed_sigma_nn,
                                  s->speed_options.speed_nn_floor,
                                  s->speed_options.speed_weight_var_mode);
@@ -1508,6 +1572,53 @@ static int write_scores(SpeedChromaStateMetal *s, unsigned slot,
     return err;
 }
 
+/**
+ * Fast mode: the rest of filter_and_downscale() and est_params() of the 4
+ * planes in s->out[slot], see speed_chroma.metal.
+ */
+static void encode_est(SpeedChromaStateMetal *s,
+                       id<MTLComputeCommandEncoder> enc, unsigned slot)
+{
+    const SpeedMetalEstParams *p = &s->est_params;
+    id<MTLComputePipelineState> pl_local =
+        vmaf_metal_pipeline(s->ms, "speed_chroma_metal_local", 0);
+    id<MTLComputePipelineState> pl_means =
+        vmaf_metal_pipeline(s->ms, "speed_chroma_metal_means", 0);
+    id<MTLComputePipelineState> pl_cov =
+        vmaf_metal_pipeline(s->ms, "speed_chroma_metal_cov", 0);
+    id<MTLComputePipelineState> pl_est =
+        vmaf_metal_pipeline(s->ms, "speed_chroma_metal_est", 0);
+
+    [enc setBytes:p length:sizeof(*p) atIndex:0];
+    [enc setBuffer:B(s->out[slot]) offset:0 atIndex:1];
+    [enc setBuffer:B(s->filter_buf) offset:0 atIndex:2];
+    [enc setBuffer:B(s->local) offset:0 atIndex:3];
+    vmaf_metal_dispatch_2d(enc, pl_local, p->w, SPEED_METAL_PLANES * p->h);
+
+    // means: one threadgroup per offset in the block and plane;
+    // covariance: one per row of the matrix and plane
+    const MTLSize tg = MTLSizeMake(32, 8, 1);
+    const MTLSize grid = MTLSizeMake(SPEED_METAL_E, SPEED_METAL_PLANES, 1);
+    [enc setComputePipelineState:pl_means];
+    [enc setBuffer:B(s->local) offset:0 atIndex:1];
+    [enc setBuffer:B(s->means) offset:0 atIndex:2];
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    [enc setComputePipelineState:pl_cov];
+    [enc setBuffer:B(s->means) offset:0 atIndex:2];
+    [enc setBuffer:B(s->cov) offset:0 atIndex:3];
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+
+    // one threadgroup per plane, of at least 2 simdgroups
+    const NSUInteger n_est = MIN(256, pl_est.maxTotalThreadsPerThreadgroup);
+    assert(n_est >= 64);
+    [enc setComputePipelineState:pl_est];
+    [enc setBuffer:B(s->local) offset:0 atIndex:1];
+    [enc setBuffer:B(s->cov) offset:0 atIndex:2];
+    [enc setBuffer:B(s->est_out[slot]) offset:0 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(SPEED_METAL_PLANES, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(n_est, 1, 1)];
+}
+
 static int extract_fex(VmafFeatureExtractor *fex,
                        VmafPicture *ref_pic, VmafPicture *ref_pic_90,
                        VmafPicture *dist_pic, VmafPicture *dist_pic_90,
@@ -1525,6 +1636,11 @@ static int extract_fex(VmafFeatureExtractor *fex,
     id<MTLComputePipelineState> pl_scale = s->scale ?
         vmaf_metal_pipeline(s->ms, "speed_chroma_metal_scale", s->bpc) : nil;
     if (!pl || (s->scale && !pl_scale)) return -EINVAL;
+    if (s->fast && (!vmaf_metal_pipeline(s->ms, "speed_chroma_metal_local", 0) ||
+                    !vmaf_metal_pipeline(s->ms, "speed_chroma_metal_means", 0) ||
+                    !vmaf_metal_pipeline(s->ms, "speed_chroma_metal_cov", 0) ||
+                    !vmaf_metal_pipeline(s->ms, "speed_chroma_metal_est", 0)))
+        return -EINVAL;
 
     // the input planes, at the size of init_chroma()
     const SpeedMetalParams *in_p = s->scale ? &s->scale_params : &s->params;
@@ -1560,6 +1676,7 @@ static int extract_fex(VmafFeatureExtractor *fex,
         [enc setBuffer:B(s->out[slot]) offset:0 atIndex:3];
         vmaf_metal_dispatch_2d(enc, pl, s->params.out_w,
                                SPEED_METAL_PLANES * s->params.out_h);
+        if (s->fast) encode_est(s, enc, slot);
         [enc endEncoding];
 
         vmaf_metal_frames_commit(&s->frames, slot, cb, ^int(int err) {

@@ -237,6 +237,8 @@ speed_chroma on the CPU. Speedups are relative to the CPU build:
   of speed_chroma, but in double. A software double FMA for the
   covariance would be exact. At 0 and 1 thread, the host part overlaps the
   GPU part, so the gain would be small.
+  Step 8 ([8-speed-chroma-fast.md](8-speed-chroma-fast.md)) runs them on
+  the GPU in fast mode.
 * **x86.** The GPU filter reproduces the arm64 build's contraction. An x86
   build without FMA contraction rounds differently. Metal on Intel Macs is
   not tested.

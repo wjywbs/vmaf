@@ -41,4 +41,20 @@ typedef struct SpeedMetalParams {
     float scaler;      // picture_copy(): divisor for bpc > 8
 } SpeedMetalParams;
 
+/**
+ * Fast mode: est_params() on the GPU, of the planes filtered down by 16.
+ * The block size of speed.c is fixed at 5: 25 elements per block.
+ */
+#define SPEED_METAL_BS 5
+#define SPEED_METAL_E (SPEED_METAL_BS * SPEED_METAL_BS)
+
+typedef struct SpeedMetalEstParams {
+    int w, h;          // the planes filtered down by 16
+    int fwidth;        // second filter
+    int sub_w, sub_h;  // submatrix of the covariance
+    int nbh, nb;       // blocks: horizontal, total
+    float sigma_nn;
+    float log2_2pie;   // log2(2 pi e)
+} SpeedMetalEstParams;
+
 #endif /* __VMAF_FEATURE_METAL_SPEED_CHROMA_METAL_H__ */

@@ -41,6 +41,15 @@ static void put(VmafPicture *pic, unsigned p, unsigned i, unsigned j, int v)
 }
 
 /**
+ * Fast mode: add texture at the scale of the planes filtered down by 16
+ * (random 8x8 tiles). Without it, the smooth planes give nearly singular
+ * covariance matrices, whose float solutions differ widely. Some frames
+ * have horizontal stripes in a plane instead: a rank deficient covariance
+ * matrix.
+ */
+static bool rough;
+
+/**
  * Chroma textures with noise (ref), and the same with more noise and
  * coarser values (dist). Some frames have flat planes, where the covariance
  * matrix is singular: both U planes, or only the distorted V plane.
@@ -57,10 +66,22 @@ static void fill(VmafPicture *ref, VmafPicture *dis, unsigned frame)
             for (unsigned j = 0; j < ref->w[p]; j++) {
                 state = state * 6364136223846793005ull +
                         1442695040888963407ull;
-                const double t = 128.0 +
+                double tile = 0.0;
+                if (rough) {
+                    uint32_t u = (i / 8) * 2654435761u ^ (j / 8) * 40503u ^
+                                 (p + 7) * 97u ^ frame * 2246822519u;
+                    u ^= u >> 15;
+                    u *= 2246822519u;
+                    u ^= u >> 13;
+                    tile = (double)(u % 61) - 30.0;
+                }
+                double t = 128.0 + tile +
                     40.0 * sin(0.05 * (j + 3.0 * frame) * (p + 1)) *
                     cos(0.03 * i * (3 - p)) +
                     (double)((state >> 40) % 9) - 4.0;
+                // rank deficient: horizontal stripes in the reference U plane
+                if (rough && p == 1 && frame % 5 == 4)
+                    t = 128.0 + 40.0 * sin(0.3 * i);
                 const double d = t + (double)((state >> 50) % 17) - 8.0;
                 const int q = 1 + frame % 4;
                 put(ref, p, i, j, flat_ref ? (int)(100 * scale) :
@@ -89,15 +110,21 @@ static const char *speed_features[] = {
     NULL,
 };
 
+/** Fast mode: the largest relative difference to the CPU seen */
+static double fast_max_rel;
+
 /**
  * Run "speed_chroma" and "speed_chroma_metal" with the options `opts`
  * ("key=value:..." or NULL) on the same synthetic frames. Add the number of
  * scores that are not bit-identical to `mismatches`, and of nonzero scores
- * to `nonzero`.
+ * to `nonzero`. In fast mode (`fast`), scores may differ from the CPU by a
+ * relative 2e-3: the float solutions of the linear systems differ, see
+ * doc/metal/8-speed-chroma-fast.md.
  */
-static int compare_speed(unsigned w, unsigned h, enum VmafPixelFormat fmt,
-                         unsigned bpc, unsigned n_threads, const char *opts,
-                         unsigned *mismatches, unsigned *nonzero)
+static int compare_speed_mode(unsigned w, unsigned h, enum VmafPixelFormat fmt,
+                              unsigned bpc, unsigned n_threads,
+                              const char *opts, bool fast,
+                              unsigned *mismatches, unsigned *nonzero)
 {
     const unsigned n_frames = 10;
     VmafContext *cpu, *gpu;
@@ -106,6 +133,13 @@ static int compare_speed(unsigned w, unsigned h, enum VmafPixelFormat fmt,
     int err = vmaf_init(&cpu, cfg);
     err |= vmaf_init(&gpu, cfg);
     if (err) return err;
+    if (fast) {
+        VmafMetalState *ms;
+        VmafMetalConfiguration mcfg = { .fast_math = 1 };
+        err = vmaf_metal_state_init(&ms, mcfg);
+        err |= vmaf_metal_import_state(gpu, ms);
+        if (err) return err;
+    }
 
     VmafFeatureDictionary *d_cpu = NULL, *d_gpu = NULL, *d_name = NULL;
     if (opts) {
@@ -166,6 +200,11 @@ static int compare_speed(unsigned w, unsigned h, enum VmafPixelFormat fmt,
             err |= vmaf_feature_score_at_index(gpu, names[k], &b, f);
             if (err) return err;
             *nonzero += a != 0.0;
+            if (fast) {
+                const double rel = fabs(a - b) / fmax(1.0, fabs(a));
+                if (rel > fast_max_rel) fast_max_rel = rel;
+                if (rel <= 2e-3) continue;
+            }
             if (memcmp(&a, &b, sizeof(a))) {
                 if ((*mismatches)++ < 5) {
                     fprintf(stderr, "%ux%u fmt %d %u-bit %s: %s frame %u: "
@@ -180,6 +219,14 @@ static int compare_speed(unsigned w, unsigned h, enum VmafPixelFormat fmt,
     vmaf_close(cpu);
     vmaf_close(gpu);
     return 0;
+}
+
+static int compare_speed(unsigned w, unsigned h, enum VmafPixelFormat fmt,
+                         unsigned bpc, unsigned n_threads, const char *opts,
+                         unsigned *mismatches, unsigned *nonzero)
+{
+    return compare_speed_mode(w, h, fmt, bpc, n_threads, opts, false,
+                              mismatches, nonzero);
 }
 
 static char *test_speed_chroma_metal_vs_cpu()
@@ -300,11 +347,69 @@ static char *test_speed_chroma_metal_threads()
     return NULL;
 }
 
+/**
+ * Fast mode: the second filter, the covariance matrix, its eigenvalues and
+ * the linear systems run on the GPU in float.
+ */
+static char *test_speed_chroma_metal_fast()
+{
+    static const struct {
+        unsigned w, h;
+        enum VmafPixelFormat fmt;
+        const char *opts;
+    } cases[] = {
+        { 640, 480, VMAF_PIX_FMT_YUV420P, NULL },
+        { 834, 586, VMAF_PIX_FMT_YUV420P, NULL },
+        { 1920, 1080, VMAF_PIX_FMT_YUV420P, NULL },
+        { 640, 360, VMAF_PIX_FMT_YUV422P, NULL },
+        { 400, 300, VMAF_PIX_FMT_YUV444P, NULL },
+        { 400, 352, VMAF_PIX_FMT_YUV420P, NULL }, // 2x2 blocks
+        { 1920, 1080, VMAF_PIX_FMT_YUV420P,
+          "speed_kernelscale=1.0:speed_nn_floor=0.1:speed_sigma_nn=0.19:speed_weight_var_mode=5:speed_max_val=45.0" },
+        { 1920, 1080, VMAF_PIX_FMT_YUV420P,
+          "speed_prescale=0.6:speed_prescale_method=bilinear:speed_nn_floor=0.1:speed_sigma_nn=0.19:speed_weight_var_mode=5" },
+        { 640, 480, VMAF_PIX_FMT_YUV420P, "speed_prescale=2.0" },
+        { 640, 480, VMAF_PIX_FMT_YUV420P, "speed_kernelscale=3.7113402" },
+        { 640, 480, VMAF_PIX_FMT_YUV420P, "speed_kernelscale=0.5" },
+        { 640, 480, VMAF_PIX_FMT_YUV420P, "speed_sigma_nn=1.5" },
+        { 640, 480, VMAF_PIX_FMT_YUV420P, "speed_weight_var_mode=3" },
+        { 640, 480, VMAF_PIX_FMT_YUV420P,
+          "speed_prescale=1.5:speed_prescale_method=bicubic" }, // on the CPU
+    };
+
+    rough = true;
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        unsigned nonzero = 0;
+        for (unsigned bpc = 8; bpc <= 10; bpc += 2) {
+            unsigned mismatches = 0;
+            int err = compare_speed_mode(cases[c].w, cases[c].h, cases[c].fmt,
+                                         bpc, c % 3 == 0 ? 4 : 0,
+                                         cases[c].opts, true, &mismatches,
+                                         &nonzero);
+            if (err || mismatches) {
+                fprintf(stderr, "fast %ux%u %s, %u-bit: error %d\n",
+                        cases[c].w, cases[c].h,
+                        cases[c].opts ? cases[c].opts : "", bpc, err);
+            }
+            mu_assert("problem running speed_chroma / speed_chroma_metal",
+                      !err);
+            mu_assert("speed_chroma_metal fast mode differs from speed_chroma",
+                      !mismatches);
+        }
+        mu_assert("all speed_chroma scores are 0", nonzero);
+    }
+    rough = false;
+    fprintf(stderr, "fast mode: max relative difference %.3g\n",
+            fast_max_rel);
+    return NULL;
+}
+
 char *run_tests()
 {
     mu_run_test(test_speed_chroma_metal_vs_cpu);
     mu_run_test(test_speed_chroma_metal_options);
     mu_run_test(test_speed_chroma_metal_prescale);
     mu_run_test(test_speed_chroma_metal_threads);
+    mu_run_test(test_speed_chroma_metal_fast);
     return NULL;
 }
