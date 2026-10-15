@@ -231,6 +231,28 @@ speed_chroma on the CPU. Speedups are relative to the CPU build:
   0.63 s at 0 threads and 0.64 s at 10, against 0.62 s and 0.64 s after
   step 5.
 
+Does the result mean vmaf_v0.6.1 is slower to compute than vmaf_v1.0.16, and vmaf_v1.0.16 has lower speedup on GPU?
+
+Yes to both. The table below comes from the benchmarks in this session: full 375-frame 1080p clip, wall time in seconds, including about 0.19 s of y4m reading.
+
+| model | threads | CPU | Metal exact | Metal fast |
+|---|---:|---:|---:|---:|
+| vmaf_v0.6.1 (default) | 0 | 12.42 | 0.63 (19.7x) | 0.41 (30.3x) |
+| vmaf_v0.6.1 (default) | 10 | 1.42 | 0.64 (2.2x) | 0.43 (3.3x) |
+| vmaf_v1.0.16_3d0h | 0 | 5.50 | 0.52 (10.6x) | 0.48 (11.5x) |
+| vmaf_v1.0.16_3d0h | 10 | 0.68 | 0.42 (1.6x) | 0.41 (1.7x) |
+
+**On the CPU, vmaf_v0.6.1 is about 2.3x slower to compute.** It uses integer VIF, which was about 75% of its CPU time in the step 0 baseline. vmaf_v1.0.16_3d0h doesn't use VIF. Its features are CAMBI, speed_chroma, adm3 and motion3, which are cheaper on the CPU.
+
+**On Metal, the two models take about the same time.** In exact mode vmaf_v1.0.16 is a bit faster (0.52 s vs 0.63 s). In fast mode vmaf_v0.6.1 is a bit faster (0.41 s vs 0.48 s). VIF's exact mode uses the software double math from step 1, and that is where most of v0.6.1's exact-vs-fast gap comes from.
+
+**vmaf_v1.0.16 has a lower GPU speedup for three reasons:**
+- **Cheaper CPU baseline.** VIF is v0.6.1's most expensive CPU feature, and it also maps very well to the GPU. v1.0.16 has no VIF, so there is less CPU time to save.
+- **Less GPU-friendly features.** CAMBI's sliding histograms and top-k selection map less well to the GPU. speed_chroma keeps its double-precision covariance and eigenvalue work on the CPU.
+- **Fixed costs weigh more.** The 0.19 s of I/O and the GPU time per frame are a large share of a 0.4–0.5 s total. At 10 threads both models are limited by the GPU and I/O, which caps the speedup at 1.6–3.3x for both.
+
+In short, the GPU makes both models cost about 0.4–0.6 s. The speedup ratio mostly shows how expensive each model was on the CPU.
+
 ## Not done
 
 * **Covariance and eigenvalues on the GPU.** They are 60 % of the CPU time
