@@ -87,6 +87,16 @@ int vmaf_metal_state_init(VmafMetalState **metal_state,
             free(s);
             return err;
         }
+
+        // The kernels need 32-wide SIMD groups, which every Apple GPU has.
+        // Intel and AMD GPUs (Intel Macs) may use other widths.
+        if (!vmaf_metal_pipeline(s, "vmaf_metal_selftest", 0)) {
+            vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                     "Metal device %s is not supported\n",
+                     vmaf_metal_device(s).name.UTF8String);
+            vmaf_metal_state_free(s);
+            return -ENOTSUP;
+        }
     }
 
     *metal_state = s;
@@ -274,6 +284,14 @@ id<MTLComputePipelineState> vmaf_metal_pipeline(VmafMetalState *s,
             vmaf_log(VMAF_LOG_LEVEL_ERROR,
                      "problem creating Metal pipeline %s: %s\n", name,
                      error.localizedDescription.UTF8String);
+            goto unlock;
+        }
+        if (pipeline.threadExecutionWidth != VMAF_METAL_SIMD_WIDTH) {
+            vmaf_log(VMAF_LOG_LEVEL_ERROR,
+                     "Metal pipeline %s has SIMD width %lu, need %d\n", name,
+                     (unsigned long)pipeline.threadExecutionWidth,
+                     VMAF_METAL_SIMD_WIDTH);
+            pipeline = nil;
             goto unlock;
         }
     }

@@ -128,11 +128,18 @@ static inline id<MTLCommandQueue> vmaf_metal_queue(VmafMetalState *s)
  *   index 1 (uint kVariant): `variant`, kernel specific
  * Thread-safe; pipelines live as long as the state.
  *
- * @return nil on error.
+ * @return nil on error, or when the pipeline's SIMD width is not
+ *         VMAF_METAL_SIMD_WIDTH.
  */
 id<MTLComputePipelineState> vmaf_metal_pipeline(VmafMetalState *s,
                                                 const char *name,
                                                 uint32_t variant);
+
+/**
+ * SIMD-group width the kernels are written for (Apple GPUs). Reductions,
+ * threadgroup array sizes and the speed_chroma eigenvalue kernel assume it.
+ */
+#define VMAF_METAL_SIMD_WIDTH 32
 
 /**
  * Allocate a buffer in shared (CPU + GPU visible) storage.

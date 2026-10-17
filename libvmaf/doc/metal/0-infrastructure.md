@@ -76,6 +76,13 @@ a fused `fmsub`, so the Metal port must use `sf_fma()` rather than
   with `xcrun metal -std=metal3.1 -fno-fast-math` and linked into
   `vmaf.metallib`. The metallib is embedded into libvmaf with `xxd`, so there
   is no runtime file dependency. Loading it at init takes about 30 ms.
+* **Apple GPUs only.** The kernels assume 32-wide SIMD groups: the
+  reductions, the threadgroup array sizes and the speed_chroma eigenvalue
+  kernel. Every Apple GPU has them; the Intel and AMD GPUs of Intel Macs may
+  use 8, 16 or 64. `vmaf_metal_state_init()` fails with `-ENOTSUP` when the
+  self-test pipeline's `threadExecutionWidth` is not 32, and the CLI then runs
+  on the CPU. `vmaf_metal_pipeline()` also rejects any later pipeline with
+  another width, since the width is chosen per kernel.
 
 ## Verification tooling
 
